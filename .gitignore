@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+config/exa_keys.txt
+config/exa_key_state.json
+config/firecrawl_key.txt
+output/
+logs/

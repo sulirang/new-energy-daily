@@ -1,0 +1,4 @@
+interface:
+  display_name: "New Energy Daily"
+  short_description: "Track European power and gas prices with ranked energy news."
+  default_prompt: "Use $new-energy-daily to fetch Italian, Hungarian, and Spanish day-ahead electricity prices plus EEX TTF, GME, CEEGEX, and MIBGAS gas benchmarks through Firecrawl, rank today's most valuable new-energy stories, and send a Chinese HTML daily report with Agent Mail."

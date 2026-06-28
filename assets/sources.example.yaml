@@ -1,0 +1,172 @@
+# Copy to config/sources.yaml and replace with the user's real sources.
+# RSS/Atom is preferred. Webpage selectors are only a fallback.
+
+timezone: Asia/Shanghai
+max_items_per_source: 20
+fetch_article_text: true
+
+# Optional top-of-report PUN Index GME and Italian physical zonal prices.
+# The VPS talks only to Firecrawl; Firecrawl's hosted browser loads GME.
+gme_zonal_prices:
+  enabled: true
+  page_url: "https://www.mercatoelettrico.org/en-us/Home/Results/Electricity/MGP/Results/ZonalPrices"
+  api_base: "https://api.firecrawl.dev"
+  proxy: "auto"
+  country: "IT"
+  languages: ["it-IT"]
+  wait_for_ms: 8000
+  timeout_ms: 120000
+  interact_timeout_seconds: 90
+  max_attempts: 2
+
+# Optional Hungarian day-ahead prices from the official HUPX Labs 15-minute dataset.
+hupx_day_ahead_prices:
+  enabled: true
+  page_url: "https://labs.hupx.hu/view/DAM_Aggregated_Trading_Data_15min_v1"
+  source_url: "https://hupx.hu"
+  api_base: "https://api.firecrawl.dev"
+  proxy: "auto"
+  country: "HU"
+  languages: ["hu-HU", "en-US"]
+  wait_for_ms: 8000
+  timeout_ms: 120000
+  interact_timeout_seconds: 60
+  max_attempts: 2
+
+# Optional Spanish day-ahead prices from OMIE's official dated TXT dataset.
+omie_day_ahead_prices:
+  enabled: true
+  page_url: "https://www.omie.es/en/market-results/daily/daily-market/day-ahead-price"
+  source_url: "https://www.omie.es/en/market-results/daily/daily-market/day-ahead-price"
+  api_base: "https://api.firecrawl.dev"
+  proxy: "auto"
+  country: "ES"
+  languages: ["es-ES", "en-US"]
+  wait_for_ms: 8000
+  timeout_ms: 120000
+  interact_timeout_seconds: 60
+  max_attempts: 2
+
+# Optional European gas benchmark. Firecrawl scrapes NDI first, then NGP on failure or missing target-day data.
+eex_ttf_gas_price:
+  enabled: true
+  ndi_url: "https://gasandregistry.eex.com/Gas/NDI/NDI_45_Days.csv"
+  ngp_url: "https://gasandregistry.eex.com/Gas/NGP/TTF_NGP_60_Days.csv"
+  ndi_source_url: "https://gasandregistry.eex.com/Gas/NDI/NDI_45_Days.csv"
+  ngp_source_url: "https://gasandregistry.eex.com/Gas/NGP/TTF_NGP_60_Days.csv"
+  api_base: "https://api.firecrawl.dev"
+  proxy: "auto"
+  country: "DE"
+  languages: ["en-US"]
+  wait_for_ms: 1000
+  timeout_ms: 120000
+  max_attempts: 2
+
+# Optional Italian natural-gas reference price from IG Index GME.
+gme_gas_price:
+  enabled: true
+  page_url: "https://www.mercatoelettrico.org/en-us/Home/Publications/Indexes-GME/IGIndexGmeResults"
+  api_base: "https://api.firecrawl.dev"
+  proxy: "auto"
+  country: "IT"
+  languages: ["it-IT"]
+  wait_for_ms: 8000
+  timeout_ms: 120000
+  interact_timeout_seconds: 60
+  max_attempts: 2
+
+# Optional Hungarian DA gas price: CEEREP first, then volume-weighted average price.
+ceegex_gas_price:
+  enabled: true
+  page_url: "https://ceegex.hu/en/market-data/daily-data"
+  source_url: "https://ceegex.hu/en/market-data/daily-data"
+  api_base: "https://api.firecrawl.dev"
+  proxy: "auto"
+  country: "HU"
+  languages: ["hu-HU", "en-US"]
+  wait_for_ms: 8000
+  timeout_ms: 120000
+  interact_timeout_seconds: 60
+  max_attempts: 2
+
+# Optional Spanish PVB Price Index for each gas day.
+mibgas_gas_price:
+  enabled: true
+  page_url: "https://www.mibgas.es/en/market-results/gas-daily-price-index-and-volumes"
+  source_url: "https://www.mibgas.es/en/market-results/gas-daily-price-index-and-volumes"
+  api_base: "https://api.firecrawl.dev"
+  proxy: "auto"
+  country: "ES"
+  languages: ["es-ES", "en-US"]
+  wait_for_ms: 10000
+  timeout_ms: 120000
+  interact_timeout_seconds: 60
+  max_attempts: 2
+
+include_keywords:
+  - 新能源
+  - 光伏
+  - 风电
+  - 储能
+  - 电池
+  - 锂电
+  - 钠电
+  - 氢能
+  - 充电桩
+  - 换电
+  - 新能源汽车
+  - 电力市场
+  - 虚拟电厂
+  - 碳市场
+  - renewable
+  - solar
+  - wind
+  - battery
+  - energy storage
+  - hydrogen
+  - EV
+  - charging
+  - grid
+
+exclude_keywords:
+  - 招聘
+  - 展会邀请
+  - 广告
+  - 促销
+
+sources:
+  # Use Exa to search daily news only within the configured websites.
+  # Add one or more API keys to config/exa_keys.txt before enabling this source.
+  - name: "Exa指定网站"
+    type: "exa"
+    enabled: false
+    query: "新能源 光伏 风电 储能 电池 氢能 新能源汽车 电力市场 {date} 新闻"
+    include_domains:
+      - "example.com"
+      - "news.example.org"
+    search_type: "auto"
+    max_results: 30
+    text_max_characters: 5000
+    append_date_to_query: true
+    use_api_date_filter: false
+    allow_undated: false
+    tags: ["综合"]
+
+  - name: "示例RSS信源"
+    type: "rss"
+    url: "https://example.com/rss.xml"
+    enabled: false
+    allow_undated: false
+    tags: ["综合"]
+
+  - name: "示例网页信源"
+    type: "webpage"
+    list_url: "https://example.com/news"
+    enabled: false
+    allow_undated: false
+    item_selector: "a"
+    title_selector: null
+    url_attr: "href"
+    date_selector: null
+    article_selector: "article"
+    tags: ["综合"]
