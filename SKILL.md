@@ -13,7 +13,9 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
 - Environment variables: start from `assets/env.example`.
 - `config/exa_keys.txt`: Exa keys, one per line. Blank lines and lines beginning with `#` are ignored.
 - `config/firecrawl_key.txt`: one Firecrawl API key used for all electricity and natural-gas market-price collection.
-- Optional run date: default to today in `Asia/Shanghai`.
+- Optional run date: collection-window end date; default to the latest completed cutoff in `Europe/Rome`.
+- Collection timezone: default to `Europe/Rome`.
+- Collection cutoff: default to 12:30 Italy time; include news published after yesterday 12:30 and through today 12:30.
 - Optional output directory: default to `output/`.
 
 ## Workflow
@@ -54,7 +56,7 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
    - Use Exa with `include_domains` when the VPS should search specified websites and retrieve article text through Exa.
    - Use webpage selectors only for sources without feeds.
    - Normalize URLs, remove tracking parameters, and deduplicate by canonical URL.
-   - Keep only items published on the target date in `Asia/Shanghai`; include undated items only when a source sets `allow_undated: true`.
+   - Keep only items in the Italy-time collection window `(yesterday 12:30, today 12:30]`; include undated items only when a source sets `allow_undated: true`.
 6. Extract article text for each candidate when possible.
    - Preserve title, URL, source, published time, summary, and extracted text.
    - Drop content shorter than 80 Chinese characters unless the title clearly carries material news.
@@ -68,6 +70,7 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
 9. Write the report in Chinese Markdown using `references/report-format.md`.
    - The "今日看点" section must be <=200 Chinese characters.
    - Each of the 15 stories must include title, source, time, news value, concise summary, and original link.
+   - Let AI return structured Chinese titles, highlights, and summaries only; render source, time, topic, value judgment, original link, and candidate statistics deterministically in Python.
    - Do not invent details that are not in the fetched material.
 10. Save Markdown to `output/YYYY-MM-DD.md` and render HTML to `output/YYYY-MM-DD.html`.
 11. Send the HTML file with Agent Mail if `AGENT_MAIL_RECIPIENTS` is configured.
@@ -131,10 +134,11 @@ Dry run without email:
 python scripts/new_energy_daily.py --sources config/sources.yaml --output output --dry-run
 ```
 
-Use cron for a daily Beijing-time run:
+Use cron for a daily 12:30 Italy-time run. `CRON_TZ=Europe/Rome` follows Italian daylight-saving changes:
 
 ```cron
-30 18 * * * cd /opt/new-energy-daily && . .venv/bin/activate && python scripts/new_energy_daily.py --sources config/sources.yaml --output output >> logs/daily.log 2>&1
+CRON_TZ=Europe/Rome
+30 12 * * * cd /opt/new-energy-daily && . .venv/bin/activate && python scripts/new_energy_daily.py --sources config/sources.yaml --output output >> logs/daily.log 2>&1
 ```
 
 ## AI Evaluation Prompt

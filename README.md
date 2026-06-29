@@ -80,7 +80,8 @@ AI_BASE_URL=https://api.openai.com/v1
 AI_MODEL=gpt-4o-mini
 
 AGENT_MAIL_RECIPIENTS=recipient@example.com
-REPORT_TIMEZONE=Asia/Shanghai
+REPORT_TIMEZONE=Europe/Rome
+COLLECTION_CUTOFF_TIME=12:30
 ```
 
 添加 Firecrawl Key：
@@ -136,10 +137,11 @@ python scripts/new_energy_daily.py --date 2026-06-26 --dry-run
 
 ## 定时任务
 
-以下示例每天北京时间 18:30 运行：
+以下示例每天意大利时间 12:30 运行，并抓取前一日 12:30（不含）至当日 12:30（含）的新闻。`Europe/Rome` 会自动处理意大利夏令时：
 
 ```cron
-30 18 * * * cd /opt/new-energy-daily && . .venv/bin/activate && python scripts/new_energy_daily.py --sources config/sources.yaml --output output >> logs/daily.log 2>&1
+CRON_TZ=Europe/Rome
+30 12 * * * cd /opt/new-energy-daily && . .venv/bin/activate && python scripts/new_energy_daily.py --sources config/sources.yaml --output output >> logs/daily.log 2>&1
 ```
 
 ## 安全说明

@@ -1,7 +1,8 @@
 # Copy to config/sources.yaml and replace with the user's real sources.
 # RSS/Atom is preferred. Webpage selectors are only a fallback.
 
-timezone: Asia/Shanghai
+timezone: Europe/Rome
+collection_cutoff_time: "12:30"
 max_items_per_source: 20
 fetch_article_text: true
 
@@ -135,22 +136,77 @@ exclude_keywords:
   - 促销
 
 sources:
-  # Use Exa to search daily news only within the configured websites.
-  # Add one or more API keys to config/exa_keys.txt before enabling this source.
-  - name: "Exa指定网站"
+  # Add one or more API keys to config/exa_keys.txt before enabling Exa sources.
+  - name: "CEPS"
     type: "exa"
-    enabled: false
-    query: "新能源 光伏 风电 储能 电池 氢能 新能源汽车 电力市场 {date} 新闻"
+    enabled: true
+    landing_page: "https://www.ceps.eu/"
+    query: "CEPS research publication energy climate electricity renewables hydrogen policy published on {date}"
     include_domains:
-      - "example.com"
-      - "news.example.org"
+      - "www.ceps.eu"
     search_type: "auto"
-    max_results: 30
-    text_max_characters: 5000
+    max_results: 15
+    text_max_characters: 6000
     append_date_to_query: true
     use_api_date_filter: false
     allow_undated: false
-    tags: ["综合"]
+    tags: ["政策", "研究", "欧洲", "能源转型"]
+
+  - name: "Oxford Institute for Energy Studies"
+    type: "exa"
+    enabled: true
+    landing_page: "https://www.oxfordenergy.org/publications/"
+    query: "Oxford Institute for Energy Studies publication electricity gas hydrogen renewable energy published on {date}"
+    include_domains: ["www.oxfordenergy.org"]
+    search_type: "auto"
+    max_results: 15
+    text_max_characters: 6000
+    append_date_to_query: true
+    use_api_date_filter: false
+    allow_undated: false
+    tags: ["研究", "欧洲", "电力市场", "天然气", "氢能"]
+
+  - name: "Energy Community"
+    type: "exa"
+    enabled: true
+    landing_page: "https://www.energy-community.org/news/Energy-Community-News.html"
+    query: "Energy Community news electricity renewable energy market reform grid published on {date}"
+    include_domains: ["www.energy-community.org"]
+    search_type: "auto"
+    max_results: 15
+    text_max_characters: 6000
+    append_date_to_query: true
+    use_api_date_filter: false
+    allow_undated: false
+    tags: ["政策", "欧洲", "电力市场", "电网"]
+
+  - name: "Agora Energiewende"
+    type: "exa"
+    enabled: true
+    landing_page: "https://www.agora-energiewende.org/news-events/filter/tab-1"
+    query: "Agora Energiewende news event publication power market renewable energy hydrogen published on {date}"
+    include_domains: ["www.agora-energiewende.org"]
+    search_type: "auto"
+    max_results: 15
+    text_max_characters: 6000
+    append_date_to_query: true
+    use_api_date_filter: false
+    allow_undated: false
+    tags: ["研究", "政策", "欧洲", "电力市场"]
+
+  - name: "Bruegel"
+    type: "exa"
+    enabled: true
+    landing_page: "https://www.bruegel.org/publications"
+    query: "Bruegel publication energy climate electricity gas hydrogen published on {date}"
+    include_domains: ["www.bruegel.org"]
+    search_type: "auto"
+    max_results: 15
+    text_max_characters: 6000
+    append_date_to_query: true
+    use_api_date_filter: false
+    allow_undated: false
+    tags: ["研究", "政策", "欧洲", "能源经济"]
 
   - name: "示例RSS信源"
     type: "rss"

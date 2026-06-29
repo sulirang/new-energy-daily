@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -192,11 +192,29 @@ def parse_datetime(value: str | None, tz: ZoneInfo) -> datetime | None:
     return None
 
 
-def is_target_day(published_at: str | None, target_day: date, tz: ZoneInfo, allow_undated: bool) -> bool:
+def parse_collection_cutoff(value: str) -> time:
+    try:
+        return datetime.strptime(value.strip(), "%H:%M").time()
+    except ValueError as exc:
+        raise ValueError(f"Invalid collection cutoff time {value!r}; expected HH:MM") from exc
+
+
+def collection_window(target_day: date, tz: ZoneInfo, cutoff: time) -> tuple[datetime, datetime]:
+    window_end = datetime.combine(target_day, cutoff, tzinfo=tz)
+    return window_end - timedelta(days=1), window_end
+
+
+def is_in_collection_window(
+    published_at: str | None,
+    window_start: datetime,
+    window_end: datetime,
+    tz: ZoneInfo,
+    allow_undated: bool,
+) -> bool:
     parsed = parse_datetime(published_at, tz)
     if not parsed:
         return allow_undated
-    return parsed.date() == target_day
+    return window_start < parsed <= window_end
 
 
 def keyword_allowed(candidate: Candidate, include_keywords: list[str], exclude_keywords: list[str]) -> bool:
@@ -208,7 +226,14 @@ def keyword_allowed(candidate: Candidate, include_keywords: list[str], exclude_k
     return True
 
 
-def fetch_rss(client: httpx.Client, source: dict[str, Any], tz: ZoneInfo, target_day: date, max_items: int) -> list[Candidate]:
+def fetch_rss(
+    client: httpx.Client,
+    source: dict[str, Any],
+    tz: ZoneInfo,
+    window_start: datetime,
+    window_end: datetime,
+    max_items: int,
+) -> list[Candidate]:
     response = client.get(source["url"])
     response.raise_for_status()
     root = ElementTree.fromstring(response.content)
@@ -233,7 +258,13 @@ def fetch_rss(client: httpx.Client, source: dict[str, Any], tz: ZoneInfo, target
         )
         if not title or not link:
             continue
-        if not is_target_day(published, target_day, tz, bool(source.get("allow_undated", False))):
+        if not is_in_collection_window(
+            published,
+            window_start,
+            window_end,
+            tz,
+            bool(source.get("allow_undated", False)),
+        ):
             continue
         items.append(
             Candidate(
@@ -258,7 +289,14 @@ def find_xml_text(element: ElementTree.Element, names: list[str]) -> str | None:
     return None
 
 
-def fetch_webpage(client: httpx.Client, source: dict[str, Any], tz: ZoneInfo, target_day: date, max_items: int) -> list[Candidate]:
+def fetch_webpage(
+    client: httpx.Client,
+    source: dict[str, Any],
+    tz: ZoneInfo,
+    window_start: datetime,
+    window_end: datetime,
+    max_items: int,
+) -> list[Candidate]:
     response = client.get(source["list_url"])
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "lxml")
@@ -273,7 +311,13 @@ def fetch_webpage(client: httpx.Client, source: dict[str, Any], tz: ZoneInfo, ta
         if source.get("date_selector"):
             date_node = node.select_one(source["date_selector"])
             date_text = clean_text(date_node.get_text(" ") if date_node else "")
-        if not is_target_day(date_text, target_day, tz, bool(source.get("allow_undated", False))):
+        if not is_in_collection_window(
+            date_text,
+            window_start,
+            window_end,
+            tz,
+            bool(source.get("allow_undated", False)),
+        ):
             continue
         items.append(
             Candidate(
@@ -343,6 +387,8 @@ def fetch_exa(
     source: dict[str, Any],
     tz: ZoneInfo,
     target_day: date,
+    window_start: datetime,
+    window_end: datetime,
     max_items: int,
     key_pool: ExaKeyPool | None = None,
 ) -> list[Candidate]:
@@ -364,15 +410,25 @@ def fetch_exa(
     if not include_domains:
         raise ValueError("Exa source requires include_domains")
 
-    query = source.get("query") or "新能源 光伏 风电 储能 电池 氢能 新能源汽车 电力市场 最新新闻 {date}"
+    query = source.get("query") or "新能源 光伏 风电 储能 电池 氢能 新能源汽车 电力市场 最新新闻"
+    has_window_placeholder = "{window_start}" in query or "{window_end}" in query
     if "{date}" in query:
         query = query.replace("{date}", target_day.isoformat())
-    elif source.get("append_date_to_query", True):
-        query = f"{query} published on {target_day.isoformat()}"
+    query = query.replace("{window_start}", window_start.strftime("%Y-%m-%d %H:%M"))
+    query = query.replace("{window_end}", window_end.strftime("%Y-%m-%d %H:%M"))
+    if source.get("append_date_to_query", True) and not has_window_placeholder:
+        timezone_name = getattr(tz, "key", str(tz))
+        query = (
+            f"{query} published between {window_start.strftime('%Y-%m-%d %H:%M')} and "
+            f"{window_end.strftime('%Y-%m-%d %H:%M')} {timezone_name}"
+        )
+    landing_page = str(source.get("landing_page") or "").strip()
+    if landing_page:
+        query = f"{query} Official listing page: {landing_page}"
     result_limit = max(1, min(100, int(source.get("max_results", max_items))))
     text_limit = max(500, min(20000, int(source.get("text_max_characters", 5000))))
-    start_at = datetime.combine(target_day, time.min, tzinfo=tz).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    end_at = datetime.combine(target_day, time.max, tzinfo=tz).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    start_at = window_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    end_at = window_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
     search_options: dict[str, Any] = {
         "type": source.get("search_type", "auto"),
@@ -417,7 +473,13 @@ def fetch_exa(
         published_text = str(published) if published is not None else None
         if not title or not url:
             continue
-        if not is_target_day(published_text, target_day, tz, bool(source.get("allow_undated", False))):
+        if not is_in_collection_window(
+            published_text,
+            window_start,
+            window_end,
+            tz,
+            bool(source.get("allow_undated", False)),
+        ):
             continue
 
         highlights = result_value(result, "highlights") or []
@@ -1451,7 +1513,12 @@ def render_report_html(report: str) -> str:
 """
 
 
-def collect_candidates(config: dict[str, Any], target_day: date, tz: ZoneInfo) -> tuple[list[Candidate], list[str]]:
+def collect_candidates(
+    config: dict[str, Any],
+    target_day: date,
+    tz: ZoneInfo,
+    cutoff: time | None = None,
+) -> tuple[list[Candidate], list[str]]:
     include_keywords = config.get("include_keywords") or []
     exclude_keywords = config.get("exclude_keywords") or []
     max_items = int(config.get("max_items_per_source", 20))
@@ -1460,6 +1527,11 @@ def collect_candidates(config: dict[str, Any], target_day: date, tz: ZoneInfo) -
     errors: list[str] = []
     seen_urls: set[str] = set()
     exa_key_pool: ExaKeyPool | None = None
+    cutoff = cutoff or parse_collection_cutoff(
+        os.environ.get("COLLECTION_CUTOFF_TIME")
+        or str(config.get("collection_cutoff_time") or "12:30")
+    )
+    window_start, window_end = collection_window(target_day, tz, cutoff)
 
     headers = {"User-Agent": "new-energy-daily/0.1 (+daily briefing bot)"}
     with httpx.Client(headers=headers, follow_redirects=True, timeout=httpx.Timeout(30.0, connect=10.0)) as client:
@@ -1468,13 +1540,21 @@ def collect_candidates(config: dict[str, Any], target_day: date, tz: ZoneInfo) -
                 continue
             try:
                 if source.get("type") == "rss":
-                    items = fetch_rss(client, source, tz, target_day, max_items)
+                    items = fetch_rss(client, source, tz, window_start, window_end, max_items)
                 elif source.get("type") == "webpage":
-                    items = fetch_webpage(client, source, tz, target_day, max_items)
+                    items = fetch_webpage(client, source, tz, window_start, window_end, max_items)
                 elif source.get("type") == "exa":
                     if exa_key_pool is None:
                         exa_key_pool = ExaKeyPool.from_environment()
-                    items = fetch_exa(source, tz, target_day, max_items, exa_key_pool)
+                    items = fetch_exa(
+                        source,
+                        tz,
+                        target_day,
+                        window_start,
+                        window_end,
+                        max_items,
+                        exa_key_pool,
+                    )
                 else:
                     errors.append(f"{source.get('name', 'unknown')}: unsupported source type")
                     continue
@@ -1600,12 +1680,23 @@ def generate_report(scored: list[ScoredItem], errors: list[str], target_day: dat
     payload = {
         "date": target_day.isoformat(),
         "constraints": [
-            "Write Chinese Markdown",
-            "今日看点 <= 200 Chinese characters",
-            "Select no more than 15 stories",
+            "Return valid JSON only",
+            "Write one highlights paragraph within 200 Chinese characters",
+            "Write a factual Chinese title, a concise 2-4 sentence Chinese summary, and a one-sentence Chinese value judgment for every input item",
+            "Keep every item rank unchanged",
             "Do not invent facts",
-            "Do not include raw scores",
         ],
+        "output_schema": {
+            "highlights": "Chinese paragraph within 200 characters",
+            "items": [
+                {
+                    "rank": "integer matching the input rank",
+                    "title_zh": "factual Chinese title",
+                    "value_judgment_zh": "one Chinese sentence explaining why the item matters",
+                    "summary_zh": "2-4 factual Chinese sentences",
+                }
+            ],
+        },
         "items": [
             {
                 "rank": idx,
@@ -1621,33 +1712,106 @@ def generate_report(scored: list[ScoredItem], errors: list[str], target_day: dat
             }
             for idx, item in enumerate(selected, 1)
         ],
-        "stats": {
-            "total_candidates": total_candidates,
-            "deduped_candidates": len(scored),
-            "selected": len(selected),
-            "sources": sorted({item.candidate.source for item in scored}),
-            "errors": errors,
-        },
     }
-    report = chat_completion(
+    content = chat_completion(
         client,
         model,
         [
             {
                 "role": "system",
                 "content": (
-                    "你是新能源产业日报编辑。根据输入材料写事实准确、克制、专业的中文Markdown日报。"
-                    "必须包含：# 新能源日报 - 日期、## 今日看点、## 今日精选、## 候选概况。"
-                    "今日看点不超过200个中文字符。"
+                    "你是新能源产业日报编辑。只根据输入材料撰写事实准确、克制、专业的中文内容。"
+                    "必须为每个输入 rank 返回对应项目，不得省略、合并或重排。只输出有效JSON。"
                 ),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
-        temperature=0.4,
+        temperature=0.3,
+        json_object=True,
     )
-    if "## 抓取异常" not in report and errors:
-        report += "\n\n## 抓取异常\n\n" + "\n".join(f"- {error}" for error in errors)
-    return enforce_highlights_limit(report, model)
+    data = json.loads(content)
+    generated_items: dict[int, dict[str, Any]] = {}
+    for generated in data.get("items", []):
+        try:
+            rank = int(generated.get("rank", 0))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= rank <= len(selected) and rank not in generated_items:
+            generated_items[rank] = generated
+
+    highlights = clean_text(str(data.get("highlights", "")))
+    if not highlights:
+        highlights = "；".join(item.reason for item in selected[:4] if item.reason)
+    compact_highlights = re.sub(r"\s+", "", highlights)
+    if len(compact_highlights) > 200:
+        highlights = compact_highlights[:200]
+
+    lines = [
+        f"# 新能源日报 - {target_day.isoformat()}",
+        "",
+        "## 今日看点",
+        "",
+        highlights,
+        "",
+        "## 今日精选",
+    ]
+    for rank, item in enumerate(selected, 1):
+        generated = generated_items.get(rank, {})
+        title = clean_text(str(generated.get("title_zh", ""))) or item.candidate.title
+        summary = clean_text(str(generated.get("summary_zh", "")))
+        if not summary:
+            summary = clean_text(item.candidate.summary or item.candidate.text or item.candidate.title)[:500]
+        source = clean_text(item.candidate.source)
+        published_at = format_report_datetime(item.candidate.published_at)
+        topic = clean_text(item.topic) or "其他"
+        reason = clean_text(str(generated.get("value_judgment_zh", ""))) or clean_text(item.reason)
+        if not reason:
+            reason = "具备当日新能源行业信息价值。"
+        original_title = escape_markdown_link_text(item.candidate.title)
+        lines.extend(
+            [
+                "",
+                f"### {rank}. {title}",
+                "",
+                f"- 来源：{source}",
+                f"- 时间：{published_at}",
+                f"- 领域：{topic}",
+                f"- 价值判断：{reason}",
+                f"- 摘要：{summary}",
+                f"- 原文：[{original_title}]({item.candidate.url})",
+            ]
+        )
+
+    sources = "、".join(sorted({clean_text(item.candidate.source) for item in scored})) or "无"
+    lines.extend(
+        [
+            "",
+            "## 候选概况",
+            "",
+            f"- 今日抓取：{total_candidates} 条",
+            f"- 去重后：{len(scored)} 条",
+            f"- 入选：{len(selected)} 条",
+            f"- 主要来源：{sources}",
+        ]
+    )
+    if errors:
+        lines.extend(["", "## 抓取异常", ""])
+        lines.extend(f"- {error}" for error in errors)
+    return "\n".join(lines).strip() + "\n"
+
+
+def format_report_datetime(value: str | None) -> str:
+    if not value:
+        return "时间未知"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def escape_markdown_link_text(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
 def enforce_highlights_limit(report: str, model: str) -> str:
@@ -1742,7 +1906,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and send a daily new-energy report with Agent Mail.")
     parser.add_argument("--sources", type=Path, default=Path("config/sources.yaml"))
     parser.add_argument("--output", type=Path, default=Path("output"))
-    parser.add_argument("--date", help="Target date in YYYY-MM-DD. Defaults to today in REPORT_TIMEZONE.")
+    parser.add_argument("--date", help="Collection-window end date in YYYY-MM-DD.")
+    parser.add_argument("--cutoff-time", help="Local collection cutoff in HH:MM. Defaults to 12:30.")
     parser.add_argument("--dry-run", action="store_true", help="Generate report but do not send email.")
     return parser.parse_args()
 
@@ -1751,8 +1916,17 @@ def main() -> int:
     load_dotenv()
     args = parse_args()
     config = load_sources(args.sources)
-    tz = ZoneInfo(os.environ.get("REPORT_TIMEZONE") or config.get("timezone") or "Asia/Shanghai")
-    target_day = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else datetime.now(tz).date()
+    tz = ZoneInfo(os.environ.get("REPORT_TIMEZONE") or config.get("timezone") or "Europe/Rome")
+    cutoff = parse_collection_cutoff(
+        args.cutoff_time
+        or os.environ.get("COLLECTION_CUTOFF_TIME")
+        or str(config.get("collection_cutoff_time") or "12:30")
+    )
+    if args.date:
+        target_day = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        now = datetime.now(tz)
+        target_day = now.date() if now.time() >= cutoff else now.date() - timedelta(days=1)
     model = os.environ.get("AI_MODEL", "gpt-4o-mini")
 
     price_snapshot = None
@@ -1811,7 +1985,9 @@ def main() -> int:
         except Exception as exc:
             mibgas_gas_error = f"{type(exc).__name__}: {exc}"
 
-    candidates, errors = collect_candidates(config, target_day, tz)
+    window_start, window_end = collection_window(target_day, tz, cutoff)
+    print(f"collection window: {window_start.isoformat()} -> {window_end.isoformat()}")
+    candidates, errors = collect_candidates(config, target_day, tz, cutoff)
     if price_error:
         errors.append(f"GME zonal prices: {price_error}")
     if gas_error:
