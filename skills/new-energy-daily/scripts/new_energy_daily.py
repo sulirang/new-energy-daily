@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -22,6 +25,23 @@ from dotenv import load_dotenv
 from markdown import markdown as render_markdown
 from openai import OpenAI
 from zoneinfo import ZoneInfo
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SOURCES_FILE = PROJECT_ROOT / "config" / "sources.yaml"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
+DEFAULT_EXA_KEYS_FILE = PROJECT_ROOT / "config" / "exa_keys.txt"
+DEFAULT_EXA_KEY_STATE_FILE = PROJECT_ROOT / "state" / "exa_key_state.json"
+DEFAULT_FIRECRAWL_KEY_FILE = PROJECT_ROOT / "config" / "firecrawl_key.txt"
+DEFAULT_SEND_STATE_FILE = PROJECT_ROOT / "state" / "sent_reports.json"
+
+
+def resolve_runtime_path(value: str | Path, default: Path) -> Path:
+    raw = str(value).strip()
+    if not raw:
+        return default
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 TRACKING_QUERY_PREFIXES = ("utm_",)
@@ -107,8 +127,8 @@ class ExaKeyPool:
 
     @classmethod
     def from_environment(cls) -> "ExaKeyPool":
-        keys_file = Path(os.environ.get("EXA_KEYS_FILE", "config/exa_keys.txt")).expanduser()
-        state_file = Path(os.environ.get("EXA_KEY_STATE_FILE", "config/exa_key_state.json")).expanduser()
+        keys_file = resolve_runtime_path(os.environ.get("EXA_KEYS_FILE", ""), DEFAULT_EXA_KEYS_FILE)
+        state_file = resolve_runtime_path(os.environ.get("EXA_KEY_STATE_FILE", ""), DEFAULT_EXA_KEY_STATE_FILE)
         keys: list[str] = []
 
         if keys_file.exists():
@@ -201,7 +221,14 @@ def parse_collection_cutoff(value: str) -> time:
 
 def collection_window(target_day: date, tz: ZoneInfo, cutoff: time) -> tuple[datetime, datetime]:
     window_end = datetime.combine(target_day, cutoff, tzinfo=tz)
-    return window_end - timedelta(days=1), window_end
+    days_back = 3 if target_day.weekday() == 0 else 1
+    window_start_day = target_day - timedelta(days=days_back)
+    window_start = datetime.combine(window_start_day, cutoff, tzinfo=tz)
+    return window_start, window_end
+
+
+def is_weekend(target_day: date) -> bool:
+    return target_day.weekday() >= 5
 
 
 def is_in_collection_window(
@@ -565,7 +592,7 @@ def parse_gme_price_stats(
 
 
 def load_firecrawl_api_key() -> str:
-    key_file = Path(os.environ.get("FIRECRAWL_KEY_FILE", "config/firecrawl_key.txt")).expanduser()
+    key_file = resolve_runtime_path(os.environ.get("FIRECRAWL_KEY_FILE", ""), DEFAULT_FIRECRAWL_KEY_FILE)
     if key_file.exists():
         for line in key_file.read_text(encoding="utf-8").splitlines():
             key = line.strip()
@@ -587,6 +614,30 @@ def firecrawl_response_json(response: httpx.Response, operation: str) -> dict[st
         detail = payload.get("error") or payload.get("message") or response.reason_phrase
         raise RuntimeError(f"Firecrawl {operation} failed ({response.status_code}): {str(detail)[:300]}")
     return payload
+
+
+def firecrawl_retry_delay(exc: Exception, attempt: int, max_attempts: int) -> float:
+    if attempt >= max_attempts - 1 or "(429)" not in str(exc):
+        return 0.0
+    match = re.search(r"retry after\s+(\d+)s", str(exc), flags=re.IGNORECASE)
+    return float(match.group(1)) + 2.0 if match else 32.0
+
+
+def wait_before_firecrawl_retry(exc: Exception, attempt: int, max_attempts: int) -> None:
+    delay = firecrawl_retry_delay(exc, attempt, max_attempts)
+    if delay > 0:
+        print(f"Firecrawl rate limited; retrying in {delay:.0f}s", file=sys.stderr)
+        time_module.sleep(delay)
+
+
+def run_market_fetch(key: str, fetcher: Any, config: dict[str, Any], target_day: date) -> Any:
+    started = time_module.monotonic()
+    print(f"market data start: {key}", flush=True)
+    try:
+        return fetcher(config, target_day)
+    finally:
+        elapsed = time_module.monotonic() - started
+        print(f"market data finish: {key} ({elapsed:.1f}s)", flush=True)
 
 
 def decode_firecrawl_result(value: Any) -> dict[str, Any]:
@@ -641,7 +692,7 @@ def run_firecrawl_interaction(
         timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
         limits=httpx.Limits(max_keepalive_connections=0),
     ) as client:
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
             scrape_id = None
             try:
                 scrape_response = client.post(
@@ -671,6 +722,7 @@ def run_firecrawl_interaction(
                 return decode_firecrawl_result(interact_payload.get("result") or interact_payload.get("stdout"))
             except Exception as exc:
                 last_error = exc
+                wait_before_firecrawl_retry(exc, attempt, max_attempts)
             finally:
                 if scrape_id:
                     try:
@@ -705,7 +757,7 @@ def run_firecrawl_scrape_text(
         timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
         limits=httpx.Limits(max_keepalive_connections=0),
     ) as client:
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
             try:
                 payload = build_firecrawl_scrape_payload(settings, page_url)
                 payload["formats"] = ["markdown"]
@@ -718,6 +770,7 @@ def run_firecrawl_scrape_text(
                 return text
             except Exception as exc:
                 last_error = exc
+                wait_before_firecrawl_retry(exc, attempt, max_attempts)
 
     raise RuntimeError(
         f"Firecrawl could not retrieve {operation} after {max_attempts} attempt(s): {last_error}"
@@ -956,7 +1009,7 @@ def fetch_gme_zonal_prices(config: dict[str, Any], target_day: date) -> GmePrice
         timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
         limits=httpx.Limits(max_keepalive_connections=0),
     ) as client:
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
             scrape_id = None
             try:
                 try:
@@ -991,6 +1044,7 @@ def fetch_gme_zonal_prices(config: dict[str, Any], target_day: date) -> GmePrice
                 break
             except Exception as exc:
                 last_error = exc
+                wait_before_firecrawl_retry(exc, attempt, max_attempts)
             finally:
                 if scrape_id:
                     try:
@@ -1063,7 +1117,7 @@ def fetch_gme_gas_price(config: dict[str, Any], target_day: date) -> GasPriceSna
         timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
         limits=httpx.Limits(max_keepalive_connections=0),
     ) as client:
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
             scrape_id = None
             try:
                 scrape_response = client.post(
@@ -1103,6 +1157,7 @@ def fetch_gme_gas_price(config: dict[str, Any], target_day: date) -> GasPriceSna
                 )
             except Exception as exc:
                 last_error = exc
+                wait_before_firecrawl_retry(exc, attempt, max_attempts)
             finally:
                 if scrape_id:
                     try:
@@ -1671,8 +1726,23 @@ def score_candidates(candidates: list[Candidate], model: str) -> list[ScoredItem
     return sorted(scored, key=lambda item: item.score, reverse=True)
 
 
-def generate_report(scored: list[ScoredItem], errors: list[str], target_day: date, model: str, total_candidates: int) -> str:
-    selected = scored[:15]
+def select_daily_items(
+    scored: list[ScoredItem],
+    minimum_score: int = 60,
+    max_items: int = 15,
+) -> list[ScoredItem]:
+    return [item for item in scored if item.selected and item.score >= minimum_score][:max_items]
+
+
+def generate_report(
+    scored: list[ScoredItem],
+    errors: list[str],
+    target_day: date,
+    model: str,
+    total_candidates: int,
+    minimum_score: int = 60,
+) -> str:
+    selected = select_daily_items(scored, minimum_score=minimum_score)
     if not selected:
         return empty_report(target_day, total_candidates, errors)
 
@@ -1869,52 +1939,121 @@ def parse_confirmation_token(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def redact_confirmation_tokens(output: str) -> str:
+    return re.sub(
+        r"(confirmation_token[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+",
+        r"\1[REDACTED]",
+        output,
+        flags=re.IGNORECASE,
+    )
+
+
 def run_agent_mail_command(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, text=True, capture_output=True, check=False)
+    timeout_seconds = int(os.environ.get("AGENT_MAIL_TIMEOUT_SECONDS", "120"))
+    return subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=PROJECT_ROOT,
+        timeout=timeout_seconds,
+    )
 
 
-def send_with_agent_mail(subject: str, body_file: Path, dry_run: bool) -> None:
-    recipients = [item.strip() for item in os.environ.get("AGENT_MAIL_RECIPIENTS", "").split(",") if item.strip()]
-    if dry_run or not recipients:
+def load_send_state(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def save_send_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp_file, path)
+
+
+def send_with_agent_mail(
+    subject: str,
+    body_file: Path,
+    dry_run: bool,
+    report_day: date,
+    force_send: bool = False,
+) -> None:
+    if dry_run:
         return
+    if is_weekend(report_day):
+        print(f"weekend delivery skipped for {report_day.isoformat()}")
+        return
+    recipients = [item.strip() for item in os.environ.get("AGENT_MAIL_RECIPIENTS", "").split(",") if item.strip()]
+    if not recipients:
+        return
+    report_key = report_day.isoformat()
+    state_file = resolve_runtime_path(
+        os.environ.get("REPORT_SEND_STATE_FILE", ""),
+        DEFAULT_SEND_STATE_FILE,
+    )
+    send_state = load_send_state(state_file)
+    if report_key in send_state and not force_send:
+        print(f"email already sent for {report_key}; use --force-send to resend")
+        return
+
     cli = os.environ.get("AGENT_MAIL_CLI", "agently-cli")
     command = [cli, "message", "+send"]
     for recipient in recipients:
         command.extend(["--to", recipient])
     try:
-        relative_body_file = body_file.resolve().relative_to(Path.cwd().resolve())
+        relative_body_file = body_file.resolve().relative_to(PROJECT_ROOT)
     except ValueError as exc:
-        raise ValueError("Agent Mail body file must be inside the current working directory") from exc
+        raise ValueError("Agent Mail body file must be inside the skill directory") from exc
     command.extend(["--subject", subject, "--body-file", relative_body_file.as_posix()])
 
     first = run_agent_mail_command(command)
     first_output = "\n".join(part for part in [first.stdout, first.stderr] if part)
     if first.returncode != 0:
-        raise RuntimeError(f"Agent Mail send failed before confirmation: {first_output.strip()}")
+        raise RuntimeError(
+            f"Agent Mail send failed before confirmation: {redact_confirmation_tokens(first_output).strip()}"
+        )
 
     token = parse_confirmation_token(first.stdout) or parse_confirmation_token(first_output)
     if not token:
-        raise RuntimeError(f"Agent Mail did not return confirmation_token: {first_output.strip()}")
+        raise RuntimeError(
+            f"Agent Mail did not return confirmation_token: {redact_confirmation_tokens(first_output).strip()}"
+        )
 
     confirmed = run_agent_mail_command(command + ["--confirmation-token", token])
     confirmed_output = "\n".join(part for part in [confirmed.stdout, confirmed.stderr] if part)
     if confirmed.returncode != 0:
-        raise RuntimeError(f"Agent Mail send confirmation failed: {confirmed_output.strip()}")
+        raise RuntimeError(
+            f"Agent Mail send confirmation failed: {redact_confirmation_tokens(confirmed_output).strip()}"
+        )
+
+    send_state[report_key] = {
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "subject": subject,
+        "body_sha256": hashlib.sha256(body_file.read_bytes()).hexdigest(),
+    }
+    save_send_state(state_file, send_state)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and send a daily new-energy report with Agent Mail.")
-    parser.add_argument("--sources", type=Path, default=Path("config/sources.yaml"))
-    parser.add_argument("--output", type=Path, default=Path("output"))
+    parser.add_argument("--sources", type=Path, default=DEFAULT_SOURCES_FILE)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--date", help="Collection-window end date in YYYY-MM-DD.")
     parser.add_argument("--cutoff-time", help="Local collection cutoff in HH:MM. Defaults to 12:30.")
     parser.add_argument("--dry-run", action="store_true", help="Generate report but do not send email.")
+    parser.add_argument("--force-send", action="store_true", help="Send again even if this date was already sent.")
     return parser.parse_args()
 
 
 def main() -> int:
-    load_dotenv()
+    load_dotenv(PROJECT_ROOT / ".env")
     args = parse_args()
+    args.sources = resolve_runtime_path(args.sources, DEFAULT_SOURCES_FILE)
+    args.output = resolve_runtime_path(args.output, DEFAULT_OUTPUT_DIR)
     config = load_sources(args.sources)
     tz = ZoneInfo(os.environ.get("REPORT_TIMEZONE") or config.get("timezone") or "Europe/Rome")
     cutoff = parse_collection_cutoff(
@@ -1929,61 +2068,54 @@ def main() -> int:
         target_day = now.date() if now.time() >= cutoff else now.date() - timedelta(days=1)
     model = os.environ.get("AI_MODEL", "gpt-4o-mini")
 
-    price_snapshot = None
-    price_error = None
-    if (config.get("gme_zonal_prices") or {}).get("enabled", False):
-        try:
-            price_snapshot = fetch_gme_zonal_prices(config, target_day)
-        except Exception as exc:
-            price_error = f"{type(exc).__name__}: {exc}"
+    market_jobs: dict[str, Any] = {}
+    market_fetchers = {
+        "gme_zonal_prices": fetch_gme_zonal_prices,
+        "gme_gas_price": fetch_gme_gas_price,
+        "hupx_day_ahead_prices": fetch_hupx_day_ahead_price,
+        "omie_day_ahead_prices": fetch_omie_day_ahead_price,
+        "eex_ttf_gas_price": fetch_eex_ttf_gas_price,
+        "ceegex_gas_price": fetch_ceegex_gas_price,
+        "mibgas_gas_price": fetch_mibgas_gas_price,
+    }
+    for key, fetcher in market_fetchers.items():
+        if (config.get(key) or {}).get("enabled", False):
+            market_jobs[key] = fetcher
 
-    gas_snapshot = None
-    gas_error = None
-    if (config.get("gme_gas_price") or {}).get("enabled", False):
-        try:
-            gas_snapshot = fetch_gme_gas_price(config, target_day)
-        except Exception as exc:
-            gas_error = f"{type(exc).__name__}: {exc}"
+    market_results: dict[str, Any] = {}
+    market_errors: dict[str, str] = {}
+    configured_workers = int(
+        os.environ.get("MARKET_MAX_WORKERS")
+        or config.get("market_max_workers")
+        or 2
+    )
+    max_workers = max(1, min(configured_workers, len(market_jobs) or 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_key = {
+            executor.submit(run_market_fetch, key, fetcher, config, target_day): key
+            for key, fetcher in market_jobs.items()
+        }
+        for future in concurrent.futures.as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                market_results[key] = future.result()
+            except Exception as exc:
+                market_errors[key] = f"{type(exc).__name__}: {exc}"
 
-    hupx_snapshot = None
-    hupx_error = None
-    if (config.get("hupx_day_ahead_prices") or {}).get("enabled", False):
-        try:
-            hupx_snapshot = fetch_hupx_day_ahead_price(config, target_day)
-        except Exception as exc:
-            hupx_error = f"{type(exc).__name__}: {exc}"
-
-    omie_snapshot = None
-    omie_error = None
-    if (config.get("omie_day_ahead_prices") or {}).get("enabled", False):
-        try:
-            omie_snapshot = fetch_omie_day_ahead_price(config, target_day)
-        except Exception as exc:
-            omie_error = f"{type(exc).__name__}: {exc}"
-
-    eex_gas_snapshot = None
-    eex_gas_error = None
-    if (config.get("eex_ttf_gas_price") or {}).get("enabled", False):
-        try:
-            eex_gas_snapshot = fetch_eex_ttf_gas_price(config, target_day)
-        except Exception as exc:
-            eex_gas_error = f"{type(exc).__name__}: {exc}"
-
-    ceegex_gas_snapshot = None
-    ceegex_gas_error = None
-    if (config.get("ceegex_gas_price") or {}).get("enabled", False):
-        try:
-            ceegex_gas_snapshot = fetch_ceegex_gas_price(config, target_day)
-        except Exception as exc:
-            ceegex_gas_error = f"{type(exc).__name__}: {exc}"
-
-    mibgas_gas_snapshot = None
-    mibgas_gas_error = None
-    if (config.get("mibgas_gas_price") or {}).get("enabled", False):
-        try:
-            mibgas_gas_snapshot = fetch_mibgas_gas_price(config, target_day)
-        except Exception as exc:
-            mibgas_gas_error = f"{type(exc).__name__}: {exc}"
+    price_snapshot = market_results.get("gme_zonal_prices")
+    price_error = market_errors.get("gme_zonal_prices")
+    gas_snapshot = market_results.get("gme_gas_price")
+    gas_error = market_errors.get("gme_gas_price")
+    hupx_snapshot = market_results.get("hupx_day_ahead_prices")
+    hupx_error = market_errors.get("hupx_day_ahead_prices")
+    omie_snapshot = market_results.get("omie_day_ahead_prices")
+    omie_error = market_errors.get("omie_day_ahead_prices")
+    eex_gas_snapshot = market_results.get("eex_ttf_gas_price")
+    eex_gas_error = market_errors.get("eex_ttf_gas_price")
+    ceegex_gas_snapshot = market_results.get("ceegex_gas_price")
+    ceegex_gas_error = market_errors.get("ceegex_gas_price")
+    mibgas_gas_snapshot = market_results.get("mibgas_gas_price")
+    mibgas_gas_error = market_errors.get("mibgas_gas_price")
 
     window_start, window_end = collection_window(target_day, tz, cutoff)
     print(f"collection window: {window_start.isoformat()} -> {window_end.isoformat()}")
@@ -2015,7 +2147,15 @@ def main() -> int:
         elif snapshot and snapshot.note:
             print(f"market data note: {label}: {snapshot.note}", file=sys.stderr)
     scored = score_candidates(candidates, model) if candidates else []
-    report = generate_report(scored, errors, target_day, model, len(candidates))
+    minimum_news_score = int(config.get("minimum_news_score", 60))
+    report = generate_report(
+        scored,
+        errors,
+        target_day,
+        model,
+        len(candidates),
+        minimum_score=minimum_news_score,
+    )
     market_modules = []
     day_ahead_modules = []
     if (config.get("gme_zonal_prices") or {}).get("enabled", False):
@@ -2117,7 +2257,13 @@ def main() -> int:
     html_file.write_text(render_report_html(report), encoding="utf-8")
 
     prefix = os.environ.get("REPORT_SUBJECT_PREFIX", "新能源日报")
-    send_with_agent_mail(f"{prefix} - {target_day.isoformat()}", html_file, args.dry_run)
+    send_with_agent_mail(
+        f"{prefix} - {target_day.isoformat()}",
+        html_file,
+        args.dry_run,
+        report_day=target_day,
+        force_send=args.force_send,
+    )
     print(f"report written: {output_file}")
     print(f"email written: {html_file}")
     print(f"candidates: {len(candidates)}, scored: {len(scored)}, errors: {len(errors)}")

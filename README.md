@@ -1,133 +1,87 @@
 # New Energy Daily
 
-面向 Hermes/VPS 的新能源日报 Skill。它每天从配置的网站获取新能源新闻，由 AI 评估新闻价值并选出最多 15 篇，生成中文 Markdown 与 HTML 日报，再通过 Agent Mail 发送邮件。
+面向 Hermes Agent 与 Linux VPS 的新能源日报 Skill。它抓取新能源新闻及欧洲电力、天然气市场数据，使用 OpenAI 兼容模型进行评分和中文写作，生成 Markdown/HTML，并可通过 Agent Mail 投递。
 
-## 主要功能
-
-- RSS、网页选择器和 Exa 指定域名搜索。
-- Exa 多 Key 轮询，额度耗尽或限流时自动切换。
-- AI 新闻价值评分、去重、Top 15 和 200 字以内“今日看点”。
-- 意大利、匈牙利、西班牙日前电价。
-- 欧洲总体、意大利、匈牙利、西班牙天然气价格。
-- Firecrawl 托管浏览器抓取市场数据，避免 VPS 直接访问目标交易所。
-- Markdown/HTML 日报与 Agent Mail 邮件发送。
-- 单个新闻源或市场数据源失败时继续生成日报，并记录异常。
-
-## 市场数据来源
-
-日前电价：
-
-- 意大利：GME PUN 与物理分区价格。
-- 匈牙利：HUPX Day-Ahead 15 分钟数据。
-- 西班牙：OMIE Day-Ahead 官方数据文件。
-
-天然气价：
-
-- 欧洲总体：EEX TTF NDI，缺失时回退到 EEX TTF NGP。
-- 意大利：GME IG Index。
-- 匈牙利：CEEGEX DA，优先 CEEREP，缺失时使用 VWAP。
-- 西班牙：MIBGAS PVB Price Index。
-
-网站、关键词及市场数据抓取参数位于 [`config/sources.yaml`](config/sources.yaml)。通用示例位于 [`assets/sources.example.yaml`](assets/sources.example.yaml)。
-
-## 所需凭据
-
-| 配置 | 是否必需 | 用途 | 推荐保存位置 |
-|---|---|---|---|
-| `AI_API_KEY` | 必需 | AI 评分和日报写作 | `.env` |
-| Firecrawl API Key | 启用市场价格时必需 | 托管浏览器和 CSV 抓取 | `config/firecrawl_key.txt` |
-| Exa API Key | 启用 Exa 新闻源时必需 | 指定网站新闻搜索与正文提取 | `config/exa_keys.txt`，每行一个 |
-| Agent Mail 授权 | 发送邮件时必需 | HTML 邮件投递 | 在 VPS 执行 OAuth 登录，不保存邮箱密码 |
-
-`AI_BASE_URL` 支持任意 OpenAI 兼容接口。Exa 可以配置多个 Key，脚本会在成功请求后轮换，并在认证、额度、限流错误时尝试下一个 Key。
-
-## 让 AI 协助配置
-
-将下面的提示词交给 Hermes、Codex 或其他负责部署的 AI：
+## 项目结构
 
 ```text
-请帮我部署 new-energy-daily Skill。先检查 config/sources.yaml、assets/env.example 和 .gitignore，然后逐项检查以下配置是否缺失：
-
-1. AI_API_KEY、AI_BASE_URL、AI_MODEL。
-2. Firecrawl API Key；将真实值写入 config/firecrawl_key.txt，每行一个值，不要写入 sources.yaml。
-3. Exa API Key；如果启用了 type: exa 的新闻源，询问我提供一个或多个 Key，并逐行写入 config/exa_keys.txt。
-4. AGENT_MAIL_RECIPIENTS；如果需要发邮件，指导我执行 agently-cli auth login 和 agently-cli +me。
-
-每次只询问当前缺少的配置。不要在回复、日志或命令输出中回显完整 Key，不要把真实 Key 提交到 Git。Linux 上将 .env、config/firecrawl_key.txt 和 config/exa_keys.txt 权限设为 600。配置完成后先运行 --dry-run，确认 Markdown 和 HTML 正常生成，再启用邮件和 cron。
+skills/new-energy-daily/
+├── SKILL.md
+├── agents/
+├── assets/
+├── config/
+├── references/
+└── scripts/new_energy_daily.py
 ```
 
-AI 应主动说明哪些凭据是必需的、哪些只在对应功能启用时需要；不要要求用户提供邮箱密码。
+该布局可作为 Hermes GitHub skill tap 安装，运行文件、参考资料和脚本会作为一个完整 Skill 下载。
 
-## VPS 安装
+## Hermes 安装
 
 ```bash
-git clone https://github.com/sulirang/new-energy-daily.git
-cd new-energy-daily
+hermes skills tap add sulirang/new-energy-daily
+hermes skills install sulirang/new-energy-daily/new-energy-daily
+hermes skills list | grep new-energy-daily
+```
 
-python -m venv .venv
+新安装的 Skill 在新会话中生效。开发或 VPS 长期部署时，也可以直接克隆仓库：
+
+```bash
+git clone https://github.com/sulirang/new-energy-daily.git /opt/new-energy-daily
+cd /opt/new-energy-daily/skills/new-energy-daily
+
+python3.12 -m venv .venv
 . .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r assets/requirements.txt
 
 cp assets/env.example .env
-npm install -g @tencent-qqmail/agently-cli
+mkdir -p output logs state
+chmod 700 output logs state
 ```
+
+推荐 Python 3.11 或 3.12。不要用 root 身份运行日报；执行定时任务的 Linux 用户必须与完成 Agent Mail OAuth 授权的用户相同。
+
+## 配置
 
 编辑 `.env`：
 
 ```dotenv
-AI_API_KEY=your_ai_api_key
-AI_BASE_URL=https://api.openai.com/v1
-AI_MODEL=gpt-4o-mini
+AI_API_KEY=your_api_key
+AI_BASE_URL=https://api.deepseek.com
+AI_MODEL=deepseek-v4-flash
 
 AGENT_MAIL_RECIPIENTS=recipient@example.com
 REPORT_TIMEZONE=Europe/Rome
 COLLECTION_CUTOFF_TIME=12:30
+MARKET_MAX_WORKERS=2
 ```
 
-添加 Firecrawl Key：
+添加 Firecrawl 与 Exa Key：
 
 ```bash
-printf '%s\n' 'fc-your-firecrawl-key' > config/firecrawl_key.txt
-chmod 600 config/firecrawl_key.txt
-```
-
-添加一个或多个 Exa Key：
-
-```bash
+printf '%s\n' 'fc-your-key' > config/firecrawl_key.txt
 printf '%s\n' 'exa-key-1' 'exa-key-2' > config/exa_keys.txt
-chmod 600 config/exa_keys.txt
+chmod 600 .env config/firecrawl_key.txt config/exa_keys.txt
 ```
 
-授权 Agent Mail：
-
-```bash
-agently-cli auth login
-agently-cli +me
-```
+真实凭据已被 `.gitignore` 排除。程序不会将 Key 写入报告，Exa 错误也会脱敏。
 
 ## 运行
 
-先生成日报但不发邮件：
+从任意目录都可以运行，默认路径会相对于 Skill 自身解析：
 
 ```bash
-python scripts/new_energy_daily.py \
-  --sources config/sources.yaml \
-  --output output \
+/opt/new-energy-daily/skills/new-energy-daily/.venv/bin/python \
+  /opt/new-energy-daily/skills/new-energy-daily/scripts/new_energy_daily.py \
   --dry-run
 ```
 
 正式生成并发送：
 
 ```bash
-python scripts/new_energy_daily.py \
-  --sources config/sources.yaml \
-  --output output
-```
-
-指定日期：
-
-```bash
-python scripts/new_energy_daily.py --date 2026-06-26 --dry-run
+cd /opt/new-energy-daily/skills/new-energy-daily
+.venv/bin/python scripts/new_energy_daily.py
 ```
 
 默认输出：
@@ -135,31 +89,44 @@ python scripts/new_energy_daily.py --date 2026-06-26 --dry-run
 - `output/YYYY-MM-DD.md`
 - `output/YYYY-MM-DD.html`
 
-## 定时任务
+同一日期成功发送后会记录到 `state/sent_reports.json`，再次运行默认不会重复发信。只有明确需要重发时才使用 `--force-send`。
 
-以下示例每天意大利时间 12:30 运行，并抓取前一日 12:30（不含）至当日 12:30（含）的新闻。`Europe/Rome` 会自动处理意大利夏令时：
+新闻采集窗口使用 `Europe/Rome` 时区和配置的 12:30 截止时间：
+
+- 周二至周日：前一日 12:30（不含）至当日 12:30（含）。
+- 周一：上周五 12:30（不含）至周一 12:30（含），覆盖周五下午、周六、周日和周一上午，避免周末新闻遗漏。
+- 周六和周日仍可生成本地预览，但 Agent Mail 始终跳过发送；`--force-send` 也不会绕过此规则。
+
+## Agent Mail
+
+```bash
+npm install -g @tencent-qqmail/agently-cli
+agently-cli auth login
+agently-cli +me
+```
+
+如全局 npm 可执行目录不在定时任务的 `PATH` 中，请在 `.env` 中给 `AGENT_MAIL_CLI` 配置绝对路径。
+
+## Hermes 定时任务
+
+仓库提供 [`deploy/hermes-new-energy-daily.sh`](deploy/hermes-new-energy-daily.sh) 模板。将其复制到 `~/.hermes/scripts/new-energy-daily.sh`，执行 `chmod 700 ~/.hermes/scripts/new-energy-daily.sh`，设置 `NEW_ENERGY_DAILY_HOME` 后使用 Hermes `no-agent` cron 运行。这样日报脚本负责确定性抓取和模型调用，Hermes 只负责调度与失败告警，不会额外启动一层 agent 推理。
+
+若使用传统 cron，先确保日志目录存在：
 
 ```cron
 CRON_TZ=Europe/Rome
-30 12 * * * cd /opt/new-energy-daily && . .venv/bin/activate && python scripts/new_energy_daily.py --sources config/sources.yaml --output output >> logs/daily.log 2>&1
+30 12 * * * cd /opt/new-energy-daily/skills/new-energy-daily && .venv/bin/python scripts/new_energy_daily.py >> logs/daily.log 2>&1
 ```
 
-## 安全说明
+## 可靠性设计
 
-以下内容已由 `.gitignore` 排除，禁止提交：
+- 默认并发抓取两组市场数据，匹配 Firecrawl 当前常见的两个并发任务限制；高额度套餐可通过 `MARKET_MAX_WORKERS` 调高。
+- Firecrawl 返回 429 时会根据服务端提示等待后自动重试，避免立即重放进一步放大限流。
+- Linux wrapper 默认给整次运行设置 15 分钟总超时，可通过 `NEW_ENERGY_DAILY_TIMEOUT` 调整。
+- 单一新闻源或市场源失败时继续生成报告，并在异常模块中说明。
+- 仅选择 AI 标记为入选且分数达到 `minimum_news_score` 的新闻，最多 15 条。
+- Agent Mail 命令带超时，确认令牌不会写入错误日志。
+- 同一日期默认仅发送一次。
+- 周末不发送邮件；周一自动汇总周末以来的新闻。
 
-- `.env`
-- `config/firecrawl_key.txt`
-- `config/exa_keys.txt`
-- `config/exa_key_state.json`
-- `output/`
-- `logs/`
-
-提交前建议运行：
-
-```bash
-git status --short
-git diff --cached --check
-```
-
-日报结构和写作约束见 [`references/report-format.md`](references/report-format.md)，完整 Skill 工作流见 [`SKILL.md`](SKILL.md)。
+日报结构见 [`skills/new-energy-daily/references/report-format.md`](skills/new-energy-daily/references/report-format.md)，完整工作流见 [`skills/new-energy-daily/SKILL.md`](skills/new-energy-daily/SKILL.md)。

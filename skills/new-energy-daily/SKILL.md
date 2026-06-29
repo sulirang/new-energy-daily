@@ -1,6 +1,13 @@
 ---
 name: new-energy-daily
 description: Generate a daily new-energy industry briefing with Italian, Hungarian, and Spanish day-ahead electricity prices; European EEX TTF, Italian GME, Hungarian CEEGEX, and Spanish MIBGAS natural-gas prices fetched through Firecrawl; and news from configured websites, Exa domain searches, RSS feeds, and article pages. Use when Hermes needs to fetch today's renewable energy, EV, battery, energy storage, hydrogen, charging infrastructure, grid, solar, wind, European power-market or gas-price news; rank items by news value; select the top 15 stories; write a Chinese daily report; save it; and send an HTML email with Agent Mail from a VPS or scheduled job.
+version: 0.2.0
+author: sulirang
+platforms: [linux]
+metadata:
+  hermes:
+    category: research
+    tags: [new-energy, daily-report, electricity, natural-gas, agent-mail]
 ---
 
 # New Energy Daily
@@ -15,7 +22,7 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
 - `config/firecrawl_key.txt`: one Firecrawl API key used for all electricity and natural-gas market-price collection.
 - Optional run date: collection-window end date; default to the latest completed cutoff in `Europe/Rome`.
 - Collection timezone: default to `Europe/Rome`.
-- Collection cutoff: default to 12:30 Italy time; include news published after yesterday 12:30 and through today 12:30.
+- Collection cutoff: default to 12:30 Italy time. Tuesday through Sunday include news after the previous day at 12:30 and through the target day at 12:30. Monday starts at the previous Friday at 12:30 so the report includes the weekend without leaving a Friday-afternoon gap.
 - Optional output directory: default to `output/`.
 
 ## Workflow
@@ -63,7 +70,7 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
 7. Ask AI to score each candidate from 0-100.
    - Reward policy/regulatory impact, large company moves, investment/financing, project commissioning, production or shipment data, technology breakthroughs, battery/storage/hydrogen/grid relevance, market impact, freshness, and source authority.
    - Penalize generic announcements, product ads, repeated syndicated copy, unverifiable claims, SEO pages, and content without concrete facts.
-8. Select the top 15 items.
+8. Select up to 15 items that the evaluator marked as selected and whose score meets `minimum_news_score`.
    - Keep the score order unless it creates obvious duplication.
    - When two items cover the same event, keep the better sourced or more detailed one.
    - Prefer a balanced mix across policy, industry, company, market, and technology when scores are close.
@@ -73,7 +80,9 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
    - Let AI return structured Chinese titles, highlights, and summaries only; render source, time, topic, value judgment, original link, and candidate statistics deterministically in Python.
    - Do not invent details that are not in the fetched material.
 10. Save Markdown to `output/YYYY-MM-DD.md` and render HTML to `output/YYYY-MM-DD.html`.
-11. Send the HTML file with Agent Mail if `AGENT_MAIL_RECIPIENTS` is configured.
+11. Send the HTML file with Agent Mail if `AGENT_MAIL_RECIPIENTS` is configured and the target day is Monday through Friday.
+    - Never send on Saturday or Sunday, including when `--force-send` is supplied.
+    - Weekend runs may still generate local Markdown and HTML previews.
 12. Log failed sources separately and continue when other sources succeed.
 
 ## Commands
@@ -97,7 +106,7 @@ exa_key_3
 
 Restrict the file on Linux with `chmod 600 config/exa_keys.txt` and never commit real keys. Override its location with `EXA_KEYS_FILE`; `EXA_API_KEYS` and the legacy `EXA_API_KEY` are also supported.
 
-The key pool rotates after every successful Exa request and stores only the next key index in `config/exa_key_state.json`. On authentication, credit, quota, or rate-limit errors, try each remaining key automatically without logging key values. Configure each Exa source with `type: exa`, a natural-language `query` containing the optional `{date}` placeholder, and one or more exact hostnames in `include_domains`. Keep `use_api_date_filter: false` unless the target site is known to work with Exa date filters; the script always applies an exact local date check in the report timezone.
+The key pool rotates after every successful Exa request and stores only the next key index in `state/exa_key_state.json`. On authentication, credit, quota, or rate-limit errors, try each remaining key automatically without logging key values. Configure each Exa source with `type: exa`, a natural-language `query` containing the optional `{date}` placeholder, and one or more exact hostnames in `include_domains`. Keep `use_api_date_filter: false` unless the target site is known to work with Exa date filters; the script always applies an exact local date check in the report timezone.
 
 Add the Firecrawl key used for market prices to `config/firecrawl_key.txt`:
 
@@ -134,11 +143,11 @@ Dry run without email:
 python scripts/new_energy_daily.py --sources config/sources.yaml --output output --dry-run
 ```
 
-Use cron for a daily 12:30 Italy-time run. `CRON_TZ=Europe/Rome` follows Italian daylight-saving changes:
+The script resolves default config, secret, state, and output paths from the Skill directory, not the caller's current directory. For Hermes cron, prefer a script-only (`no-agent`) wrapper in `~/.hermes/scripts/`; for traditional cron, use a daily 12:30 Italy-time run. `CRON_TZ=Europe/Rome` follows Italian daylight-saving changes:
 
 ```cron
 CRON_TZ=Europe/Rome
-30 12 * * * cd /opt/new-energy-daily && . .venv/bin/activate && python scripts/new_energy_daily.py --sources config/sources.yaml --output output >> logs/daily.log 2>&1
+30 12 * * * cd /opt/new-energy-daily/skills/new-energy-daily && .venv/bin/python scripts/new_energy_daily.py >> logs/daily.log 2>&1
 ```
 
 ## AI Evaluation Prompt
@@ -180,3 +189,5 @@ agently-cli message +send --to recipient@example.com --subject "新能源日报 
 Agent Mail send operations use two-step confirmation. The first command returns `data.confirmation_token`; rerun the same command with `--confirmation-token <token>` to complete the send. `scripts/new_energy_daily.py` performs both steps automatically.
 
 Set recipients with `AGENT_MAIL_RECIPIENTS`, comma-separated. Do not store mail-account passwords for this skill.
+
+Weekend delivery is disabled. On Monday, the news window begins at the previous Friday's cutoff and Exa receives the same expanded date range in its query before Python applies the exact local-time filter.

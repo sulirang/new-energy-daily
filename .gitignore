@@ -1,9 +1,10 @@
-.env
-.venv/
+**/.env
+**/.venv/
 __pycache__/
 *.py[cod]
-config/exa_keys.txt
-config/exa_key_state.json
-config/firecrawl_key.txt
-output/
-logs/
+.pytest_cache/
+skills/new-energy-daily/config/exa_keys.txt
+skills/new-energy-daily/config/firecrawl_key.txt
+skills/new-energy-daily/state/
+skills/new-energy-daily/output/
+skills/new-energy-daily/logs/

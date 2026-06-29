@@ -5,6 +5,8 @@ timezone: Europe/Rome
 collection_cutoff_time: "12:30"
 max_items_per_source: 20
 fetch_article_text: true
+minimum_news_score: 60
+market_max_workers: 2
 
 # Optional top-of-report PUN Index GME and Italian physical zonal prices.
 # The VPS talks only to Firecrawl; Firecrawl's hosted browser loads GME.

@@ -2,6 +2,8 @@ timezone: Europe/Rome
 collection_cutoff_time: "12:30"
 max_items_per_source: 30
 fetch_article_text: true
+minimum_news_score: 60
+market_max_workers: 2
 
 gme_zonal_prices:
   enabled: true
