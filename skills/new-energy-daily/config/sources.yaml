@@ -117,6 +117,35 @@ exclude_keywords:
   - sponsored
 
 sources:
+  - name: "ENTSO-E"
+    type: "rss"
+    url: "https://www.entsoe.eu/rss/news.xml"
+    enabled: true
+    allow_undated: false
+    tags: ["欧洲", "电网", "电力市场"]
+
+  - name: "European Commission Energy"
+    type: "rss"
+    url: "https://energy.ec.europa.eu/node/2/rss_en"
+    enabled: true
+    allow_undated: false
+    tags: ["政策", "欧盟", "能源转型"]
+
+  - name: "Euractiv Energy"
+    type: "exa"
+    enabled: true
+    landing_page: "https://www.euractiv.com/topics/energy/"
+    query: "Euractiv energy policy electricity gas renewables grid climate published between {window_start} and {window_end}"
+    include_domains:
+      - "www.euractiv.com"
+    search_type: "auto"
+    max_results: 20
+    text_max_characters: 6000
+    append_date_to_query: true
+    use_api_date_filter: false
+    allow_undated: false
+    tags: ["政策", "欧洲", "能源市场"]
+
   - name: "pv magazine Italia"
     type: "rss"
     url: "https://www.pv-magazine.it/feed/"

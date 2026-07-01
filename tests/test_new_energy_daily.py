@@ -30,6 +30,17 @@ def test_project_root_is_skill_directory() -> None:
     assert MODULE.DEFAULT_SOURCES_FILE.exists()
 
 
+def test_verified_news_sources_use_rss_and_exa_fallback() -> None:
+    config = MODULE.load_sources(MODULE.DEFAULT_SOURCES_FILE)
+    sources = {source["name"]: source for source in config["sources"]}
+    assert sources["ENTSO-E"]["type"] == "rss"
+    assert sources["ENTSO-E"]["url"] == "https://www.entsoe.eu/rss/news.xml"
+    assert sources["European Commission Energy"]["type"] == "rss"
+    assert sources["European Commission Energy"]["url"] == "https://energy.ec.europa.eu/node/2/rss_en"
+    assert sources["Euractiv Energy"]["type"] == "exa"
+    assert sources["Euractiv Energy"]["include_domains"] == ["www.euractiv.com"]
+
+
 def test_collection_window_handles_italian_dst() -> None:
     start, end = MODULE.collection_window(
         date(2026, 3, 29),
