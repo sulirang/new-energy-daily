@@ -19,10 +19,10 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
 - `config/sources.yaml`: user-provided news sources. Start from `assets/sources.example.yaml`.
 - Environment variables: start from `assets/env.example`.
 - `config/exa_keys.txt`: Exa keys, one per line. Blank lines and lines beginning with `#` are ignored.
-- `config/firecrawl_key.txt`: one Firecrawl API key used for all electricity and natural-gas market-price collection.
+- `config/firecrawl_key.txt`: Firecrawl API keys, one per line, used for electricity and natural-gas market-price collection.
 - Optional run date: collection-window end date; default to the latest completed cutoff in `Europe/Rome`.
 - Collection timezone: default to `Europe/Rome`.
-- Collection cutoff: default to 12:30 Italy time. Tuesday through Sunday include news after the previous day at 12:30 and through the target day at 12:30. Monday starts at the previous Friday at 12:30 so the report includes the weekend without leaving a Friday-afternoon gap.
+- Collection cutoff: default to 07:00 Italy time. Tuesday through Sunday include news after the previous day at 07:00 and through the target day at 07:00. Monday starts at the previous Friday at 07:00 so the report includes the weekend without leaving a Friday daytime gap.
 - Optional output directory: default to `output/`.
 
 ## Workflow
@@ -63,7 +63,7 @@ Use this skill to produce a daily Chinese new-energy briefing from user-provided
    - Use Exa with `include_domains` when the VPS should search specified websites and retrieve article text through Exa.
    - Use webpage selectors only for sources without feeds.
    - Normalize URLs, remove tracking parameters, and deduplicate by canonical URL.
-   - Keep only items in the Italy-time collection window `(yesterday 12:30, today 12:30]`; include undated items only when a source sets `allow_undated: true`.
+   - Keep only items in the Italy-time collection window `(yesterday 07:00, today 07:00]`; include undated items only when a source sets `allow_undated: true`.
 6. Extract article text for each candidate when possible.
    - Preserve title, URL, source, published time, summary, and extracted text.
    - Drop content shorter than 80 Chinese characters unless the title clearly carries material news.
@@ -106,15 +106,16 @@ exa_key_3
 
 Restrict the file on Linux with `chmod 600 config/exa_keys.txt` and never commit real keys. Override its location with `EXA_KEYS_FILE`; `EXA_API_KEYS` and the legacy `EXA_API_KEY` are also supported.
 
-The key pool rotates after every successful Exa request and stores only the next key index in `state/exa_key_state.json`. On authentication, credit, quota, or rate-limit errors, try each remaining key automatically without logging key values. Configure each Exa source with `type: exa`, a natural-language `query` containing the optional `{date}` placeholder, and one or more exact hostnames in `include_domains`. Keep `use_api_date_filter: false` unless the target site is known to work with Exa date filters; the script always applies an exact local date check in the report timezone.
+The key pool rotates after every successful Exa request and stores only the next key index in `state/exa_key_state.json`. On authentication, credit, quota, or rate-limit errors, try each remaining key automatically without logging key values. Configure each Exa source with `type: exa`, a natural-language `query` containing `{window_start}` and `{window_end}`, and one or more exact hostnames in `include_domains`. The legacy `{date}` placeholder remains supported and expands to every calendar date touched by the cutoff-to-cutoff window. Keep `use_api_date_filter: false` unless the target site is known to work with Exa date filters; the script always applies the exact local-time window in the report timezone.
 
-Add the Firecrawl key used for market prices to `config/firecrawl_key.txt`:
+Add the Firecrawl keys used for market prices to `config/firecrawl_key.txt`, one per line:
 
 ```text
-fc-your-firecrawl-key
+fc-key-1
+fc-key-2
 ```
 
-Restrict it with `chmod 600 config/firecrawl_key.txt` and never commit it. Override its location with `FIRECRAWL_KEY_FILE`, or use `FIRECRAWL_API_KEY`. The configured `FIRECRAWL_API_BASE` defaults to the hosted service at `https://api.firecrawl.dev`; using a self-hosted instance does not hide the VPS IP unless that instance has its own outbound proxy.
+Restrict it with `chmod 600 config/firecrawl_key.txt` and never commit it. Override its location with `FIRECRAWL_KEY_FILE`; `FIRECRAWL_API_KEYS` accepts a comma-, semicolon-, or whitespace-separated pool, and the legacy `FIRECRAWL_API_KEY` remains supported. Requests rotate across the pool and automatically try the remaining keys on authentication, credit, quota, or rate-limit errors without logging key values. Only the next index is stored in `state/firecrawl_key_state.json`; override that path with `FIRECRAWL_KEY_STATE_FILE`. The configured `FIRECRAWL_API_BASE` defaults to the hosted service at `https://api.firecrawl.dev`; using a self-hosted instance does not hide the VPS IP unless that instance has its own outbound proxy.
 
 Install or update the Agent Mail skill for the target agent:
 
@@ -143,11 +144,11 @@ Dry run without email:
 python scripts/new_energy_daily.py --sources config/sources.yaml --output output --dry-run
 ```
 
-The script resolves default config, secret, state, and output paths from the Skill directory, not the caller's current directory. For Hermes cron, prefer a script-only (`no-agent`) wrapper in `~/.hermes/scripts/`; for traditional cron, use a daily 12:30 Italy-time run. `CRON_TZ=Europe/Rome` follows Italian daylight-saving changes:
+The script resolves default config, secret, state, and output paths from the Skill directory, not the caller's current directory. For Hermes cron, prefer a script-only (`no-agent`) wrapper in `~/.hermes/scripts/`; for traditional cron, use a daily 07:00 Italy-time run. `CRON_TZ=Europe/Rome` follows Italian daylight-saving changes:
 
 ```cron
 CRON_TZ=Europe/Rome
-30 12 * * * cd /opt/new-energy-daily/skills/new-energy-daily && .venv/bin/python scripts/new_energy_daily.py >> logs/daily.log 2>&1
+0 7 * * * cd /opt/new-energy-daily/skills/new-energy-daily && .venv/bin/python scripts/new_energy_daily.py >> logs/daily.log 2>&1
 ```
 
 ## AI Evaluation Prompt

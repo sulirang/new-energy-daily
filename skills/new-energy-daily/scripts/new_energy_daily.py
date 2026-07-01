@@ -9,8 +9,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time as time_module
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_EXA_KEYS_FILE = PROJECT_ROOT / "config" / "exa_keys.txt"
 DEFAULT_EXA_KEY_STATE_FILE = PROJECT_ROOT / "state" / "exa_key_state.json"
 DEFAULT_FIRECRAWL_KEY_FILE = PROJECT_ROOT / "config" / "firecrawl_key.txt"
+DEFAULT_FIRECRAWL_KEY_STATE_FILE = PROJECT_ROOT / "state" / "firecrawl_key_state.json"
 DEFAULT_SEND_STATE_FILE = PROJECT_ROOT / "state" / "sent_reports.json"
 
 
@@ -166,6 +168,74 @@ class ExaKeyPool:
             os.replace(temp_file, self.state_file)
         except OSError as exc:
             print(f"warning: could not persist Exa key rotation state: {exc}", file=sys.stderr)
+
+
+@dataclass
+class FirecrawlKeyPool:
+    keys: list[str]
+    state_file: Path
+    cursor: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    @classmethod
+    def from_environment(cls) -> "FirecrawlKeyPool":
+        keys_file = resolve_runtime_path(os.environ.get("FIRECRAWL_KEY_FILE", ""), DEFAULT_FIRECRAWL_KEY_FILE)
+        state_file = resolve_runtime_path(
+            os.environ.get("FIRECRAWL_KEY_STATE_FILE", ""),
+            DEFAULT_FIRECRAWL_KEY_STATE_FILE,
+        )
+        keys: list[str] = []
+
+        if keys_file.exists():
+            for line in keys_file.read_text(encoding="utf-8").splitlines():
+                key = line.strip()
+                if key and not key.startswith("#") and key not in keys:
+                    keys.append(key)
+
+        environment_keys = re.split(r"[\s,;]+", os.environ.get("FIRECRAWL_API_KEYS", "").strip())
+        legacy_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+        for key in [*environment_keys, legacy_key]:
+            if key and key not in {"your_firecrawl_api_key", "fc-your-firecrawl-key"} and key not in keys:
+                keys.append(key)
+
+        if not keys:
+            raise RuntimeError(f"No Firecrawl API keys found in {keys_file} or environment variables")
+
+        cursor = 0
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            cursor = int(state.get("next_index", 0)) % len(keys)
+        except (FileNotFoundError, OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            pass
+        return cls(keys=keys, state_file=state_file, cursor=cursor)
+
+    def reserve_attempts(self) -> list[tuple[int, str]]:
+        with self.lock:
+            start = self.cursor
+            self.cursor = (self.cursor + 1) % len(self.keys)
+            try:
+                self.state_file.parent.mkdir(parents=True, exist_ok=True)
+                temp_file = self.state_file.with_name(f".{self.state_file.name}.{os.getpid()}.tmp")
+                temp_file.write_text(json.dumps({"next_index": self.cursor}) + "\n", encoding="utf-8")
+                os.replace(temp_file, self.state_file)
+            except OSError as exc:
+                print(f"warning: could not persist Firecrawl key rotation state: {exc}", file=sys.stderr)
+            return [
+                ((start + offset) % len(self.keys), self.keys[(start + offset) % len(self.keys)])
+                for offset in range(len(self.keys))
+            ]
+
+
+_FIRECRAWL_KEY_POOL: FirecrawlKeyPool | None = None
+_FIRECRAWL_KEY_POOL_LOCK = threading.Lock()
+
+
+def get_firecrawl_key_pool() -> FirecrawlKeyPool:
+    global _FIRECRAWL_KEY_POOL
+    with _FIRECRAWL_KEY_POOL_LOCK:
+        if _FIRECRAWL_KEY_POOL is None:
+            _FIRECRAWL_KEY_POOL = FirecrawlKeyPool.from_environment()
+        return _FIRECRAWL_KEY_POOL
 
 
 def clean_text(value: str | None) -> str:
@@ -410,6 +480,46 @@ def redact_exa_error(exc: Exception, keys: list[str]) -> str:
     return message[:500]
 
 
+def build_exa_query(
+    source: dict[str, Any],
+    tz: ZoneInfo,
+    target_day: date,
+    window_start: datetime,
+    window_end: datetime,
+) -> str:
+    query = source.get("query") or "新能源 光伏 风电 储能 电池 氢能 新能源汽车 电力市场 最新新闻"
+    has_full_window_placeholder = "{window_start}" in query and "{window_end}" in query
+
+    if "{date}" in query:
+        current_day = window_start.date()
+        window_dates = []
+        while current_day <= window_end.date():
+            window_dates.append(current_day.isoformat())
+            current_day += timedelta(days=1)
+        date_expression = (
+            target_day.isoformat()
+            if len(window_dates) == 1
+            else f"({' OR '.join(window_dates)})"
+        )
+        query = query.replace("{date}", date_expression)
+
+    query = query.replace("{window_start}", window_start.strftime("%Y-%m-%d %H:%M"))
+    query = query.replace("{window_end}", window_end.strftime("%Y-%m-%d %H:%M"))
+    timezone_name = getattr(tz, "key", str(tz))
+    if has_full_window_placeholder:
+        query = f"{query} {timezone_name}"
+    elif source.get("append_date_to_query", True):
+        query = (
+            f"{query} published between {window_start.strftime('%Y-%m-%d %H:%M')} and "
+            f"{window_end.strftime('%Y-%m-%d %H:%M')} {timezone_name}"
+        )
+
+    landing_page = str(source.get("landing_page") or "").strip()
+    if landing_page:
+        query = f"{query} Official listing page: {landing_page}"
+    return query
+
+
 def fetch_exa(
     source: dict[str, Any],
     tz: ZoneInfo,
@@ -437,21 +547,7 @@ def fetch_exa(
     if not include_domains:
         raise ValueError("Exa source requires include_domains")
 
-    query = source.get("query") or "新能源 光伏 风电 储能 电池 氢能 新能源汽车 电力市场 最新新闻"
-    has_window_placeholder = "{window_start}" in query or "{window_end}" in query
-    if "{date}" in query:
-        query = query.replace("{date}", target_day.isoformat())
-    query = query.replace("{window_start}", window_start.strftime("%Y-%m-%d %H:%M"))
-    query = query.replace("{window_end}", window_end.strftime("%Y-%m-%d %H:%M"))
-    if source.get("append_date_to_query", True) and not has_window_placeholder:
-        timezone_name = getattr(tz, "key", str(tz))
-        query = (
-            f"{query} published between {window_start.strftime('%Y-%m-%d %H:%M')} and "
-            f"{window_end.strftime('%Y-%m-%d %H:%M')} {timezone_name}"
-        )
-    landing_page = str(source.get("landing_page") or "").strip()
-    if landing_page:
-        query = f"{query} Official listing page: {landing_page}"
+    query = build_exa_query(source, tz, target_day, window_start, window_end)
     result_limit = max(1, min(100, int(source.get("max_results", max_items))))
     text_limit = max(500, min(20000, int(source.get("text_max_characters", 5000))))
     start_at = window_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -591,18 +687,59 @@ def parse_gme_price_stats(
     return average_price, max(prices), min(prices), len(prices)
 
 
-def load_firecrawl_api_key() -> str:
-    key_file = resolve_runtime_path(os.environ.get("FIRECRAWL_KEY_FILE", ""), DEFAULT_FIRECRAWL_KEY_FILE)
-    if key_file.exists():
-        for line in key_file.read_text(encoding="utf-8").splitlines():
-            key = line.strip()
-            if key and not key.startswith("#"):
-                return key
+def firecrawl_error_status(exc: Exception) -> int | None:
+    match = re.search(r"\((401|402|403|429)\)", str(exc))
+    return int(match.group(1)) if match else None
 
-    key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
-    if key and key != "your_firecrawl_api_key":
-        return key
-    raise RuntimeError(f"No Firecrawl API key found in {key_file} or FIRECRAWL_API_KEY")
+
+def is_firecrawl_key_failure(exc: Exception) -> bool:
+    if firecrawl_error_status(exc) in {401, 402, 403, 429}:
+        return True
+    message = str(exc).lower()
+    return any(
+        phrase in message
+        for phrase in (
+            "api key",
+            "unauthorized",
+            "forbidden",
+            "insufficient credit",
+            "insufficient balance",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "exhausted",
+        )
+    )
+
+
+def redact_firecrawl_error(exc: Exception, keys: list[str]) -> str:
+    message = str(exc)
+    for key in keys:
+        message = message.replace(key, "<redacted>")
+    return message[:500]
+
+
+def run_with_firecrawl_keys(
+    operation: str,
+    request: Any,
+    key_pool: FirecrawlKeyPool | None = None,
+) -> Any:
+    key_pool = key_pool or get_firecrawl_key_pool()
+    key_errors = []
+    for key_index, api_key in key_pool.reserve_attempts():
+        try:
+            return request(api_key)
+        except Exception as exc:
+            if not is_firecrawl_key_failure(exc):
+                raise
+            safe_error = redact_firecrawl_error(exc, key_pool.keys)
+            key_errors.append(f"key {key_index + 1}: {safe_error}")
+            print(
+                f"warning: Firecrawl key {key_index + 1}/{len(key_pool.keys)} unavailable; trying next key",
+                file=sys.stderr,
+            )
+    details = "; ".join(key_errors)
+    raise RuntimeError(f"All {len(key_pool.keys)} Firecrawl API keys are unavailable for {operation}: {details}")
 
 
 def firecrawl_response_json(response: httpx.Response, operation: str) -> dict[str, Any]:
@@ -673,108 +810,122 @@ def run_firecrawl_interaction(
     interaction_code: str,
     origin: str,
     operation: str,
+    key_pool: FirecrawlKeyPool | None = None,
 ) -> dict[str, Any]:
-    api_key = load_firecrawl_api_key()
+    key_pool = key_pool or get_firecrawl_key_pool()
     api_base = os.environ.get("FIRECRAWL_API_BASE", settings.get("api_base", "https://api.firecrawl.dev")).rstrip("/")
     timeout_ms = int(settings.get("timeout_ms", 120000))
     interact_timeout = int(settings.get("interact_timeout_seconds", 60))
     max_attempts = max(1, int(settings.get("max_attempts", 2)))
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Connection": "close",
-        "User-Agent": "new-energy-daily/1.0",
-    }
-    last_error: Exception | None = None
 
-    with httpx.Client(
-        headers=headers,
-        timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
-        limits=httpx.Limits(max_keepalive_connections=0),
-    ) as client:
-        for attempt in range(max_attempts):
-            scrape_id = None
-            try:
-                scrape_response = client.post(
-                    f"{api_base}/v2/scrape",
-                    json=build_firecrawl_scrape_payload(settings, page_url),
-                )
-                scrape_payload = firecrawl_response_json(scrape_response, f"{operation} scrape")
-                scrape_data = scrape_payload.get("data") or {}
-                scrape_id = (scrape_data.get("metadata") or {}).get("scrapeId") or scrape_data.get("scrapeId")
-                if not scrape_id:
-                    raise RuntimeError(f"Firecrawl {operation} scrape did not return a scrapeId")
+    def request(api_key: str) -> dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Connection": "close",
+            "User-Agent": "new-energy-daily/1.0",
+        }
+        last_error: Exception | None = None
 
-                interact_response = client.post(
-                    f"{api_base}/v2/scrape/{scrape_id}/interact",
-                    json={
-                        "code": interaction_code,
-                        "language": "node",
-                        "timeout": interact_timeout,
-                        "origin": origin,
-                    },
-                )
-                interact_payload = firecrawl_response_json(interact_response, f"{operation} interact")
-                if interact_payload.get("exitCode") not in (None, 0):
-                    raise RuntimeError(
-                        f"Firecrawl {operation} interact exited with code {interact_payload['exitCode']}"
+        with httpx.Client(
+            headers=headers,
+            timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
+            limits=httpx.Limits(max_keepalive_connections=0),
+        ) as client:
+            for attempt in range(max_attempts):
+                scrape_id = None
+                try:
+                    scrape_response = client.post(
+                        f"{api_base}/v2/scrape",
+                        json=build_firecrawl_scrape_payload(settings, page_url),
                     )
-                return decode_firecrawl_result(interact_payload.get("result") or interact_payload.get("stdout"))
-            except Exception as exc:
-                last_error = exc
-                wait_before_firecrawl_retry(exc, attempt, max_attempts)
-            finally:
-                if scrape_id:
-                    try:
-                        client.delete(f"{api_base}/v2/scrape/{scrape_id}/interact")
-                    except Exception:
-                        pass
+                    scrape_payload = firecrawl_response_json(scrape_response, f"{operation} scrape")
+                    scrape_data = scrape_payload.get("data") or {}
+                    scrape_id = (scrape_data.get("metadata") or {}).get("scrapeId") or scrape_data.get("scrapeId")
+                    if not scrape_id:
+                        raise RuntimeError(f"Firecrawl {operation} scrape did not return a scrapeId")
 
-    raise RuntimeError(
-        f"Firecrawl could not retrieve {operation} after {max_attempts} attempt(s): {last_error}"
-    )
+                    interact_response = client.post(
+                        f"{api_base}/v2/scrape/{scrape_id}/interact",
+                        json={
+                            "code": interaction_code,
+                            "language": "node",
+                            "timeout": interact_timeout,
+                            "origin": origin,
+                        },
+                    )
+                    interact_payload = firecrawl_response_json(interact_response, f"{operation} interact")
+                    if interact_payload.get("exitCode") not in (None, 0):
+                        raise RuntimeError(
+                            f"Firecrawl {operation} interact exited with code {interact_payload['exitCode']}"
+                        )
+                    return decode_firecrawl_result(interact_payload.get("result") or interact_payload.get("stdout"))
+                except Exception as exc:
+                    last_error = exc
+                    if len(key_pool.keys) > 1 and is_firecrawl_key_failure(exc):
+                        raise
+                    wait_before_firecrawl_retry(exc, attempt, max_attempts)
+                finally:
+                    if scrape_id:
+                        try:
+                            client.delete(f"{api_base}/v2/scrape/{scrape_id}/interact")
+                        except Exception:
+                            pass
+
+        raise RuntimeError(
+            f"Firecrawl could not retrieve {operation} after {max_attempts} attempt(s): {last_error}"
+        )
+
+    return run_with_firecrawl_keys(operation, request, key_pool)
 
 
 def run_firecrawl_scrape_text(
     settings: dict[str, Any],
     page_url: str,
     operation: str,
+    key_pool: FirecrawlKeyPool | None = None,
 ) -> str:
-    api_key = load_firecrawl_api_key()
+    key_pool = key_pool or get_firecrawl_key_pool()
     api_base = os.environ.get("FIRECRAWL_API_BASE", settings.get("api_base", "https://api.firecrawl.dev")).rstrip("/")
     timeout_ms = int(settings.get("timeout_ms", 120000))
     max_attempts = max(1, int(settings.get("max_attempts", 2)))
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Connection": "close",
-        "User-Agent": "new-energy-daily/1.0",
-    }
-    last_error: Exception | None = None
 
-    with httpx.Client(
-        headers=headers,
-        timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
-        limits=httpx.Limits(max_keepalive_connections=0),
-    ) as client:
-        for attempt in range(max_attempts):
-            try:
-                payload = build_firecrawl_scrape_payload(settings, page_url)
-                payload["formats"] = ["markdown"]
-                response = client.post(f"{api_base}/v2/scrape", json=payload)
-                response_payload = firecrawl_response_json(response, operation)
-                data = response_payload.get("data") or {}
-                text = data.get("markdown") or data.get("rawHtml")
-                if not isinstance(text, str) or not text.strip():
-                    raise ValueError(f"Firecrawl {operation} returned no text")
-                return text
-            except Exception as exc:
-                last_error = exc
-                wait_before_firecrawl_retry(exc, attempt, max_attempts)
+    def request(api_key: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Connection": "close",
+            "User-Agent": "new-energy-daily/1.0",
+        }
+        last_error: Exception | None = None
 
-    raise RuntimeError(
-        f"Firecrawl could not retrieve {operation} after {max_attempts} attempt(s): {last_error}"
-    )
+        with httpx.Client(
+            headers=headers,
+            timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
+            limits=httpx.Limits(max_keepalive_connections=0),
+        ) as client:
+            for attempt in range(max_attempts):
+                try:
+                    payload = build_firecrawl_scrape_payload(settings, page_url)
+                    payload["formats"] = ["markdown"]
+                    response = client.post(f"{api_base}/v2/scrape", json=payload)
+                    response_payload = firecrawl_response_json(response, operation)
+                    data = response_payload.get("data") or {}
+                    text = data.get("markdown") or data.get("rawHtml")
+                    if not isinstance(text, str) or not text.strip():
+                        raise ValueError(f"Firecrawl {operation} returned no text")
+                    return text
+                except Exception as exc:
+                    last_error = exc
+                    if len(key_pool.keys) > 1 and is_firecrawl_key_failure(exc):
+                        raise
+                    wait_before_firecrawl_retry(exc, attempt, max_attempts)
+
+        raise RuntimeError(
+            f"Firecrawl could not retrieve {operation} after {max_attempts} attempt(s): {last_error}"
+        )
+
+    return run_with_firecrawl_keys(operation, request, key_pool)
 
 
 def build_gme_firecrawl_code(target_day: date) -> str:
@@ -989,71 +1140,13 @@ def fetch_gme_zonal_prices(config: dict[str, Any], target_day: date) -> GmePrice
         "page_url",
         "https://www.mercatoelettrico.org/en-us/Home/Results/Electricity/MGP/Results/ZonalPrices",
     )
-    api_key = load_firecrawl_api_key()
-    api_base = os.environ.get("FIRECRAWL_API_BASE", settings.get("api_base", "https://api.firecrawl.dev")).rstrip("/")
-    timeout_ms = int(settings.get("timeout_ms", 120000))
-    interact_timeout = int(settings.get("interact_timeout_seconds", 90))
-    max_attempts = max(1, int(settings.get("max_attempts", 2)))
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Connection": "close",
-        "User-Agent": "new-energy-daily/1.0",
-    }
-    interaction_code = build_gme_firecrawl_code(target_day)
-    last_error: Exception | None = None
-    result: dict[str, Any] | None = None
-
-    with httpx.Client(
-        headers=headers,
-        timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
-        limits=httpx.Limits(max_keepalive_connections=0),
-    ) as client:
-        for attempt in range(max_attempts):
-            scrape_id = None
-            try:
-                try:
-                    scrape_response = client.post(
-                        f"{api_base}/v2/scrape",
-                        json=build_firecrawl_scrape_payload(settings, page_url),
-                    )
-                except Exception as exc:
-                    raise RuntimeError(f"Firecrawl scrape request failed: {exc}") from exc
-                scrape_payload = firecrawl_response_json(scrape_response, "scrape")
-                scrape_data = scrape_payload.get("data") or {}
-                scrape_id = (scrape_data.get("metadata") or {}).get("scrapeId") or scrape_data.get("scrapeId")
-                if not scrape_id:
-                    raise RuntimeError("Firecrawl scrape did not return a scrapeId")
-
-                try:
-                    interact_response = client.post(
-                        f"{api_base}/v2/scrape/{scrape_id}/interact",
-                        json={
-                            "code": interaction_code,
-                            "language": "node",
-                            "timeout": interact_timeout,
-                            "origin": "new-energy-daily-gme",
-                        },
-                    )
-                except Exception as exc:
-                    raise RuntimeError(f"Firecrawl interact request failed: {exc}") from exc
-                interact_payload = firecrawl_response_json(interact_response, "interact")
-                if interact_payload.get("exitCode") not in (None, 0):
-                    raise RuntimeError(f"Firecrawl interact exited with code {interact_payload['exitCode']}")
-                result = decode_firecrawl_result(interact_payload.get("result") or interact_payload.get("stdout"))
-                break
-            except Exception as exc:
-                last_error = exc
-                wait_before_firecrawl_retry(exc, attempt, max_attempts)
-            finally:
-                if scrape_id:
-                    try:
-                        client.delete(f"{api_base}/v2/scrape/{scrape_id}/interact")
-                    except Exception:
-                        pass
-
-    if result is None:
-        raise RuntimeError(f"Firecrawl could not retrieve GME prices after {max_attempts} attempt(s): {last_error}")
+    result = run_firecrawl_interaction(
+        settings,
+        page_url,
+        build_gme_firecrawl_code(target_day),
+        "new-energy-daily-gme",
+        "GME prices",
+    )
 
     pun_payload = result.get("pun") or {}
     pun_average, pun_highest, pun_lowest, pun_periods = parse_gme_price_stats(
@@ -1097,75 +1190,26 @@ def fetch_gme_gas_price(config: dict[str, Any], target_day: date) -> GasPriceSna
         "page_url",
         "https://www.mercatoelettrico.org/en-us/Home/Publications/Indexes-GME/IGIndexGmeResults",
     )
-    api_key = load_firecrawl_api_key()
-    api_base = os.environ.get("FIRECRAWL_API_BASE", settings.get("api_base", "https://api.firecrawl.dev")).rstrip("/")
-    timeout_ms = int(settings.get("timeout_ms", 120000))
-    interact_timeout = int(settings.get("interact_timeout_seconds", 60))
-    max_attempts = max(1, int(settings.get("max_attempts", 2)))
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Connection": "close",
-        "User-Agent": "new-energy-daily/1.0",
-    }
-    interaction_code = build_gme_gas_firecrawl_code(target_day)
     expected_date = int(target_day.strftime("%Y%m%d"))
-    last_error: Exception | None = None
-
-    with httpx.Client(
-        headers=headers,
-        timeout=httpx.Timeout((timeout_ms / 1000) + 30, connect=30.0),
-        limits=httpx.Limits(max_keepalive_connections=0),
-    ) as client:
-        for attempt in range(max_attempts):
-            scrape_id = None
-            try:
-                scrape_response = client.post(
-                    f"{api_base}/v2/scrape",
-                    json=build_firecrawl_scrape_payload(settings, page_url),
-                )
-                scrape_payload = firecrawl_response_json(scrape_response, "IG Index scrape")
-                scrape_data = scrape_payload.get("data") or {}
-                scrape_id = (scrape_data.get("metadata") or {}).get("scrapeId") or scrape_data.get("scrapeId")
-                if not scrape_id:
-                    raise RuntimeError("Firecrawl IG Index scrape did not return a scrapeId")
-
-                interact_response = client.post(
-                    f"{api_base}/v2/scrape/{scrape_id}/interact",
-                    json={
-                        "code": interaction_code,
-                        "language": "node",
-                        "timeout": interact_timeout,
-                        "origin": "new-energy-daily-gas",
-                    },
-                )
-                interact_payload = firecrawl_response_json(interact_response, "IG Index interact")
-                if interact_payload.get("exitCode") not in (None, 0):
-                    raise RuntimeError(f"Firecrawl IG Index interact exited with code {interact_payload['exitCode']}")
-                result = decode_firecrawl_result(interact_payload.get("result") or interact_payload.get("stdout"))
-                entries = result.get("entries") if isinstance(result.get("entries"), list) else []
-                entry = next((item for item in entries if int(item.get("data", 0)) == expected_date), None)
-                if not entry or entry.get("igi") is None:
-                    raise ValueError(f"IG Index GME returned no price for {target_day.isoformat()}")
-                return GasPriceSnapshot(
-                    target_day=target_day,
-                    effective_day=target_day,
-                    region="意大利",
-                    price_eur_mwh=float(entry["igi"]),
-                    source_name="Gestore dei Mercati Energetici",
-                    source_url=page_url,
-                )
-            except Exception as exc:
-                last_error = exc
-                wait_before_firecrawl_retry(exc, attempt, max_attempts)
-            finally:
-                if scrape_id:
-                    try:
-                        client.delete(f"{api_base}/v2/scrape/{scrape_id}/interact")
-                    except Exception:
-                        pass
-
-    raise RuntimeError(f"Firecrawl could not retrieve IG Index GME after {max_attempts} attempt(s): {last_error}")
+    result = run_firecrawl_interaction(
+        settings,
+        page_url,
+        build_gme_gas_firecrawl_code(target_day),
+        "new-energy-daily-gas",
+        "IG Index GME",
+    )
+    entries = result.get("entries") if isinstance(result.get("entries"), list) else []
+    entry = next((item for item in entries if int(item.get("data", 0)) == expected_date), None)
+    if not entry or entry.get("igi") is None:
+        raise ValueError(f"IG Index GME returned no price for {target_day.isoformat()}")
+    return GasPriceSnapshot(
+        target_day=target_day,
+        effective_day=target_day,
+        region="意大利",
+        price_eur_mwh=float(entry["igi"]),
+        source_name="Gestore dei Mercati Energetici",
+        source_url=page_url,
+    )
 
 
 def parse_market_number(value: Any) -> float | None:
@@ -1584,7 +1628,7 @@ def collect_candidates(
     exa_key_pool: ExaKeyPool | None = None
     cutoff = cutoff or parse_collection_cutoff(
         os.environ.get("COLLECTION_CUTOFF_TIME")
-        or str(config.get("collection_cutoff_time") or "12:30")
+        or str(config.get("collection_cutoff_time") or "07:00")
     )
     window_start, window_end = collection_window(target_day, tz, cutoff)
 
@@ -1633,6 +1677,25 @@ def openai_client() -> OpenAI:
     )
 
 
+def should_retry_without_json_mode(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status != 400:
+        return False
+    message = str(exc).lower()
+    mentions_json_mode = "response_format" in message or "json_object" in message
+    unsupported_markers = (
+        "unsupported",
+        "not support",
+        "unknown parameter",
+        "unrecognized",
+        "invalid parameter",
+        "not allowed",
+    )
+    return mentions_json_mode and any(marker in message for marker in unsupported_markers)
+
+
 def chat_completion(client: OpenAI, model: str, messages: list[dict[str, str]], temperature: float, json_object: bool = False) -> str:
     kwargs: dict[str, Any] = {
         "model": model,
@@ -1643,8 +1706,8 @@ def chat_completion(client: OpenAI, model: str, messages: list[dict[str, str]], 
         kwargs["response_format"] = {"type": "json_object"}
     try:
         response = client.chat.completions.create(**kwargs)
-    except Exception:
-        if not json_object:
+    except Exception as exc:
+        if not json_object or not should_retry_without_json_mode(exc):
             raise
         kwargs.pop("response_format", None)
         response = client.chat.completions.create(**kwargs)
@@ -2043,7 +2106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sources", type=Path, default=DEFAULT_SOURCES_FILE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--date", help="Collection-window end date in YYYY-MM-DD.")
-    parser.add_argument("--cutoff-time", help="Local collection cutoff in HH:MM. Defaults to 12:30.")
+    parser.add_argument("--cutoff-time", help="Local collection cutoff in HH:MM. Defaults to 07:00.")
     parser.add_argument("--dry-run", action="store_true", help="Generate report but do not send email.")
     parser.add_argument("--force-send", action="store_true", help="Send again even if this date was already sent.")
     return parser.parse_args()
@@ -2059,7 +2122,7 @@ def main() -> int:
     cutoff = parse_collection_cutoff(
         args.cutoff_time
         or os.environ.get("COLLECTION_CUTOFF_TIME")
-        or str(config.get("collection_cutoff_time") or "12:30")
+        or str(config.get("collection_cutoff_time") or "07:00")
     )
     if args.date:
         target_day = datetime.strptime(args.date, "%Y-%m-%d").date()

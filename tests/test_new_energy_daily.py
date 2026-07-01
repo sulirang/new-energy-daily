@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,40 +34,148 @@ def test_collection_window_handles_italian_dst() -> None:
     start, end = MODULE.collection_window(
         date(2026, 3, 29),
         ZoneInfo("Europe/Rome"),
-        MODULE.parse_collection_cutoff("12:30"),
+        MODULE.parse_collection_cutoff("07:00"),
     )
-    assert start.isoformat() == "2026-03-28T12:30:00+01:00"
-    assert end.isoformat() == "2026-03-29T12:30:00+02:00"
+    assert start.isoformat() == "2026-03-28T07:00:00+01:00"
+    assert end.isoformat() == "2026-03-29T07:00:00+02:00"
 
 
 def test_monday_collection_window_starts_on_friday() -> None:
     start, end = MODULE.collection_window(
         date(2026, 6, 29),
         ZoneInfo("Europe/Rome"),
-        MODULE.parse_collection_cutoff("12:30"),
+        MODULE.parse_collection_cutoff("07:00"),
     )
-    assert start.isoformat() == "2026-06-26T12:30:00+02:00"
-    assert end.isoformat() == "2026-06-29T12:30:00+02:00"
+    assert start.isoformat() == "2026-06-26T07:00:00+02:00"
+    assert end.isoformat() == "2026-06-29T07:00:00+02:00"
 
 
 def test_monday_window_preserves_dst_offsets() -> None:
     start, end = MODULE.collection_window(
         date(2026, 3, 30),
         ZoneInfo("Europe/Rome"),
-        MODULE.parse_collection_cutoff("12:30"),
+        MODULE.parse_collection_cutoff("07:00"),
     )
-    assert start.isoformat() == "2026-03-27T12:30:00+01:00"
-    assert end.isoformat() == "2026-03-30T12:30:00+02:00"
+    assert start.isoformat() == "2026-03-27T07:00:00+01:00"
+    assert end.isoformat() == "2026-03-30T07:00:00+02:00"
 
 
 def test_tuesday_collection_window_starts_on_monday() -> None:
     start, end = MODULE.collection_window(
         date(2026, 6, 30),
         ZoneInfo("Europe/Rome"),
-        MODULE.parse_collection_cutoff("12:30"),
+        MODULE.parse_collection_cutoff("07:00"),
     )
-    assert start.isoformat() == "2026-06-29T12:30:00+02:00"
-    assert end.isoformat() == "2026-06-30T12:30:00+02:00"
+    assert start.isoformat() == "2026-06-29T07:00:00+02:00"
+    assert end.isoformat() == "2026-06-30T07:00:00+02:00"
+
+
+def test_exa_query_uses_the_exact_weekday_cutoff_window() -> None:
+    tz = ZoneInfo("Europe/Rome")
+    start, end = MODULE.collection_window(
+        date(2026, 6, 30),
+        tz,
+        MODULE.parse_collection_cutoff("07:00"),
+    )
+    query = MODULE.build_exa_query(
+        {"query": "energy published between {window_start} and {window_end}"},
+        tz,
+        date(2026, 6, 30),
+        start,
+        end,
+    )
+    assert "2026-06-29 07:00" in query
+    assert "2026-06-30 07:00" in query
+    assert "Europe/Rome" in query
+
+
+def test_exa_legacy_date_placeholder_covers_every_monday_window_date() -> None:
+    tz = ZoneInfo("Europe/Rome")
+    start, end = MODULE.collection_window(
+        date(2026, 6, 29),
+        tz,
+        MODULE.parse_collection_cutoff("07:00"),
+    )
+    query = MODULE.build_exa_query(
+        {"query": "energy published on {date}"},
+        tz,
+        date(2026, 6, 29),
+        start,
+        end,
+    )
+    assert "(2026-06-26 OR 2026-06-27 OR 2026-06-28 OR 2026-06-29)" in query
+    assert "published between 2026-06-26 07:00 and 2026-06-29 07:00" in query
+
+
+def test_firecrawl_key_pool_rotates_and_persists(tmp_path: Path) -> None:
+    state_file = tmp_path / "firecrawl-state.json"
+    pool = MODULE.FirecrawlKeyPool(["first", "second"], state_file)
+    assert [key for _, key in pool.reserve_attempts()] == ["first", "second"]
+    assert json.loads(state_file.read_text(encoding="utf-8")) == {"next_index": 1}
+    assert [key for _, key in pool.reserve_attempts()] == ["second", "first"]
+    assert json.loads(state_file.read_text(encoding="utf-8")) == {"next_index": 0}
+
+
+def test_firecrawl_key_pool_loads_multiple_environment_keys(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setenv("FIRECRAWL_KEY_FILE", str(tmp_path / "missing-keys.txt"))
+    monkeypatch.setenv("FIRECRAWL_KEY_STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("FIRECRAWL_API_KEYS", "first, second;third")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "third")
+    pool = MODULE.FirecrawlKeyPool.from_environment()
+    assert pool.keys == ["first", "second", "third"]
+
+
+def test_firecrawl_key_failure_uses_next_key_and_redacts_errors(tmp_path: Path, capsys: object) -> None:
+    pool = MODULE.FirecrawlKeyPool(["first-secret", "second-secret"], tmp_path / "state.json")
+    attempted = []
+
+    def request(api_key: str) -> str:
+        attempted.append(api_key)
+        if api_key == "first-secret":
+            raise RuntimeError("Firecrawl smoke failed (401): invalid api key first-secret")
+        return "ok"
+
+    assert MODULE.run_with_firecrawl_keys("smoke", request, pool) == "ok"
+    assert attempted == ["first-secret", "second-secret"]
+    captured = capsys.readouterr()
+    assert "first-secret" not in captured.err
+
+
+class FakeCompletions:
+    def __init__(self, failures: list[Exception]) -> None:
+        self.failures = failures
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if self.failures:
+            raise self.failures.pop(0)
+        message = SimpleNamespace(content='{"ok": true}')
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def fake_client(completions: FakeCompletions) -> object:
+    return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+
+def test_json_mode_does_not_retry_authentication_errors() -> None:
+    error = RuntimeError("authentication failed")
+    error.status_code = 401
+    completions = FakeCompletions([error])
+    with pytest.raises(RuntimeError, match="authentication failed"):
+        MODULE.chat_completion(fake_client(completions), "model", [], 0.0, json_object=True)
+    assert len(completions.calls) == 1
+
+
+def test_json_mode_retries_only_when_response_format_is_unsupported() -> None:
+    error = RuntimeError("unsupported parameter: response_format")
+    error.status_code = 400
+    completions = FakeCompletions([error])
+    content = MODULE.chat_completion(fake_client(completions), "model", [], 0.0, json_object=True)
+    assert content == '{"ok": true}'
+    assert len(completions.calls) == 2
+    assert "response_format" in completions.calls[0]
+    assert "response_format" not in completions.calls[1]
 
 
 def test_selection_respects_model_decision_threshold_and_limit() -> None:

@@ -18,16 +18,19 @@ skills/new-energy-daily/
 
 ## Hermes 安装
 
+Hermes 的 GitHub tap 当前读取仓库默认分支，不提供选择非默认分支的参数。因此，以下 tap 命令应在本分支合并到 `main` 后使用：
+
 ```bash
 hermes skills tap add sulirang/new-energy-daily
 hermes skills install sulirang/new-energy-daily/new-energy-daily
 hermes skills list | grep new-energy-daily
 ```
 
-新安装的 Skill 在新会话中生效。开发或 VPS 长期部署时，也可以直接克隆仓库：
+合并前测试 `codex/hermes-linux-hardening`，或在 VPS 长期部署该分支时，必须显式指定分支：
 
 ```bash
-git clone https://github.com/sulirang/new-energy-daily.git /opt/new-energy-daily
+git clone --branch codex/hermes-linux-hardening --single-branch \
+  https://github.com/sulirang/new-energy-daily.git /opt/new-energy-daily
 cd /opt/new-energy-daily/skills/new-energy-daily
 
 python3.12 -m venv .venv
@@ -49,18 +52,18 @@ chmod 700 output logs state
 ```dotenv
 AI_API_KEY=your_api_key
 AI_BASE_URL=https://api.deepseek.com
-AI_MODEL=deepseek-v4-flash
+AI_MODEL=deepseek-v4-pro
 
 AGENT_MAIL_RECIPIENTS=recipient@example.com
 REPORT_TIMEZONE=Europe/Rome
-COLLECTION_CUTOFF_TIME=12:30
+COLLECTION_CUTOFF_TIME=07:00
 MARKET_MAX_WORKERS=2
 ```
 
 添加 Firecrawl 与 Exa Key：
 
 ```bash
-printf '%s\n' 'fc-your-key' > config/firecrawl_key.txt
+printf '%s\n' 'fc-key-1' 'fc-key-2' > config/firecrawl_key.txt
 printf '%s\n' 'exa-key-1' 'exa-key-2' > config/exa_keys.txt
 chmod 600 .env config/firecrawl_key.txt config/exa_keys.txt
 ```
@@ -91,10 +94,11 @@ cd /opt/new-energy-daily/skills/new-energy-daily
 
 同一日期成功发送后会记录到 `state/sent_reports.json`，再次运行默认不会重复发信。只有明确需要重发时才使用 `--force-send`。
 
-新闻采集窗口使用 `Europe/Rome` 时区和配置的 12:30 截止时间：
+新闻采集窗口使用 `Europe/Rome` 时区和配置的 07:00 截止时间：
 
-- 周二至周日：前一日 12:30（不含）至当日 12:30（含）。
-- 周一：上周五 12:30（不含）至周一 12:30（含），覆盖周五下午、周六、周日和周一上午，避免周末新闻遗漏。
+- 周二至周日：前一日 07:00（不含）至当日 07:00（含）。
+- 周一：上周五 07:00（不含）至周一 07:00（含），覆盖周五白天、周六、周日和周一清晨，避免周末新闻遗漏。
+- RSS、网页和 Exa 返回的候选都会再按上述本地时间窗口精确过滤；Exa 查询本身也会携带窗口起止时间。
 - 周六和周日仍可生成本地预览，但 Agent Mail 始终跳过发送；`--force-send` 也不会绕过此规则。
 
 ## Agent Mail
@@ -115,13 +119,14 @@ agently-cli +me
 
 ```cron
 CRON_TZ=Europe/Rome
-30 12 * * * cd /opt/new-energy-daily/skills/new-energy-daily && .venv/bin/python scripts/new_energy_daily.py >> logs/daily.log 2>&1
+0 7 * * * cd /opt/new-energy-daily/skills/new-energy-daily && .venv/bin/python scripts/new_energy_daily.py >> logs/daily.log 2>&1
 ```
 
 ## 可靠性设计
 
 - 默认并发抓取两组市场数据，匹配 Firecrawl 当前常见的两个并发任务限制；高额度套餐可通过 `MARKET_MAX_WORKERS` 调高。
 - Firecrawl 返回 429 时会根据服务端提示等待后自动重试，避免立即重放进一步放大限流。
+- Firecrawl 支持多 Key 轮询；每次市场请求预留下一个 Key，认证、额度或限流失败时自动切换，其轮询位置只记录在 `state/firecrawl_key_state.json`。
 - Linux wrapper 默认给整次运行设置 15 分钟总超时，可通过 `NEW_ENERGY_DAILY_TIMEOUT` 调整。
 - 单一新闻源或市场源失败时继续生成报告，并在异常模块中说明。
 - 仅选择 AI 标记为入选且分数达到 `minimum_news_score` 的新闻，最多 15 条。

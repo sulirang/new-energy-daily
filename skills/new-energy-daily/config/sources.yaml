@@ -1,5 +1,5 @@
 timezone: Europe/Rome
-collection_cutoff_time: "12:30"
+collection_cutoff_time: "07:00"
 max_items_per_source: 30
 fetch_article_text: true
 minimum_news_score: 60
@@ -127,7 +127,7 @@ sources:
   - name: "pv magazine Italia"
     type: "exa"
     enabled: true
-    query: "notizie fotovoltaico solare accumulo idrogeno energie rinnovabili pubblicate il {date}"
+    query: "notizie fotovoltaico solare accumulo idrogeno energie rinnovabili pubblicate tra {window_start} e {window_end}"
     include_domains:
       - "www.pv-magazine.it"
     search_type: "auto"
@@ -142,7 +142,7 @@ sources:
     type: "exa"
     enabled: true
     landing_page: "https://www.ceps.eu/"
-    query: "CEPS research publication energy climate electricity renewables hydrogen policy published on {date}"
+    query: "CEPS research publication energy climate electricity renewables hydrogen policy published between {window_start} and {window_end}"
     include_domains:
       - "www.ceps.eu"
     search_type: "auto"
@@ -157,7 +157,7 @@ sources:
     type: "exa"
     enabled: true
     landing_page: "https://www.oxfordenergy.org/publications/"
-    query: "Oxford Institute for Energy Studies publication electricity gas hydrogen renewable energy published on {date}"
+    query: "Oxford Institute for Energy Studies publication electricity gas hydrogen renewable energy published between {window_start} and {window_end}"
     include_domains:
       - "www.oxfordenergy.org"
     search_type: "auto"
@@ -172,7 +172,7 @@ sources:
     type: "exa"
     enabled: true
     landing_page: "https://www.energy-community.org/news/Energy-Community-News.html"
-    query: "Energy Community news electricity renewable energy market reform grid published on {date}"
+    query: "Energy Community news electricity renewable energy market reform grid published between {window_start} and {window_end}"
     include_domains:
       - "www.energy-community.org"
     search_type: "auto"
@@ -187,7 +187,7 @@ sources:
     type: "exa"
     enabled: true
     landing_page: "https://www.agora-energiewende.org/news-events/filter/tab-1"
-    query: "Agora Energiewende news event publication power market renewable energy hydrogen published on {date}"
+    query: "Agora Energiewende news event publication power market renewable energy hydrogen published between {window_start} and {window_end}"
     include_domains:
       - "www.agora-energiewende.org"
     search_type: "auto"
@@ -202,7 +202,7 @@ sources:
     type: "exa"
     enabled: true
     landing_page: "https://www.bruegel.org/publications"
-    query: "Bruegel publication energy climate electricity gas hydrogen published on {date}"
+    query: "Bruegel publication energy climate electricity gas hydrogen published between {window_start} and {window_end}"
     include_domains:
       - "www.bruegel.org"
     search_type: "auto"
